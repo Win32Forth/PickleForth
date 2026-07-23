@@ -1774,44 +1774,45 @@ _word_empty:
     NEXT
 
 // \ ( -- ) IMMEDIATE  discard rest of parse area (to end of line)
+// Note: _source_end clobbers x0/x1 — keep cursor in x10.
 XBACKSLASH:
     bl _cursor_load
-    mov x1, x0
+    mov x10, x0                     // cursor
     bl _source_end
-    mov x9, x0
+    mov x9, x0                      // end
 _bs_loop:
-    cmp x1, x9
+    cmp x10, x9
     b.hs _bs_done
-    ldrb w2, [x1]
+    ldrb w2, [x10]
     cbz w2, _bs_done
     cmp w2, #10
     b.eq _bs_done
-    add x1, x1, #1
+    add x10, x10, #1
     b _bs_loop
 _bs_done:
-    mov x0, x1
+    mov x0, x10
     bl _cursor_store
     NEXT
 
 // ( ( -- ) IMMEDIATE  paren comment; discard until ')'
 XPAREN:
     bl _cursor_load
-    mov x1, x0
+    mov x10, x0                     // cursor
     bl _source_end
-    mov x9, x0
+    mov x9, x0                      // end
 _par_loop:
-    cmp x1, x9
+    cmp x10, x9
     b.hs _par_done
-    ldrb w2, [x1]
+    ldrb w2, [x10]
     cbz w2, _par_done
     cmp w2, #41
     b.eq _par_found
-    add x1, x1, #1
+    add x10, x10, #1
     b _par_loop
 _par_found:
-    add x1, x1, #1
+    add x10, x10, #1
 _par_done:
-    mov x0, x1
+    mov x0, x10
     bl _cursor_store
     NEXT
 
