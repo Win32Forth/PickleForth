@@ -1,0 +1,29 @@
+# Build products
+pickleforth
+pickleforth_debug
+*.o
+*.out
+
+# Debug symbols
+*.dSYM/
+*.dSYM
+
+# Xcode
+PickleForth.xcodeproj/xcuserdata/
+PickleForth.xcodeproj/project.xcworkspace/xcuserdata/
+DerivedData/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor / tooling
+*.swp
+*~
+.idea/
+.vscode/
+.grok/
