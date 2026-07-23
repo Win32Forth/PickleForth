@@ -63,17 +63,15 @@
 //   CELL     — push 8; not an ANS word (CELL+ / CELLS are ANS)
 //
 // Still missing major ANS Core pieces:
-//   EVALUATE REFILL
-//   C"  MOVE CMOVE
-//   VALUE TO POSTPONE
-//   >NUMBER  (pictured <# # #S #> HOLD SIGN PAD done)
-//   CASE OF ENDOF ENDCASE
-//   CATCH THROW  ENVIRONMENT?
+//   REFILL  C"  VALUE TO  >NUMBER  ENVIRONMENT?
 //
 // Batch-1: S" ."  ANS FIND  SOURCE  >IN
 // Batch-2: DO LOOP +LOOP I J LEAVE UNLOOP  DOES>  pictured numeric
+// Batch-3: POSTPONE  MOVE CMOVE CMOVE>  CASE OF ENDOF ENDCASE
+//          EVALUATE (nested SOURCE)  CATCH THROW
 //   Note: DO/LOOP are compilation words (use inside : defs). CREATE body is
 //   does_ip at +0, user PFA at +8 (DOVAR/DODOES/DOCON aware).
+//   EVALUATE nests SOURCE via a stack (also used by INCLUDE/FLOAD).
 //
 // Implementation notes:
 //   - Indirect threaded; compiled cells are dictionary entry addresses
@@ -167,8 +165,8 @@ _main:
     mov  x20, #0
 
     // Initialize latest_var to newest static word
-    adrp x0, dict_does@page
-    add  x0, x0, dict_does@pageoff
+    adrp x0, dict_catch_ok@page
+    add  x0, x0, dict_catch_ok@pageoff
     str  x0, [x24]
 
     // HERE = user_dict_area
@@ -679,6 +677,22 @@ _patch_dict:
     PATCH_LINK dict_does, dict_pad
     nop
     PATCH_CODE dict_does, XDOES
+    nop
+    PATCH_LINK dict_evaluate, dict_does
+    nop
+    PATCH_CODE dict_evaluate, XEVALUATE
+    nop
+    PATCH_LINK dict_catch, dict_evaluate
+    nop
+    PATCH_CODE dict_catch, XCATCH
+    nop
+    PATCH_LINK dict_throw, dict_catch
+    nop
+    PATCH_CODE dict_throw, XTHROW
+    nop
+    PATCH_LINK dict_catch_ok, dict_throw
+    nop
+    PATCH_CODE dict_catch_ok, XCATCH_OK
     nop
 
     .purgem PATCH_CODE
@@ -1392,7 +1406,8 @@ XINCLUDE:
     strb wzr, [x0]
 
 _include_done_restore:
-    // set SOURCE before restoring VM so x26 length is available
+    // Nest SOURCE: push current, then switch to file (x26 = length)
+    bl _push_source
     adrp x0, file_buffer@page
     add x0, x0, file_buffer@pageoff
     mov x1, x26
@@ -1400,6 +1415,14 @@ _include_done_restore:
     b.ge 1f
     mov x1, #0
 1:
+    // x0/x1 still set — _push_source clobbers them! reload:
+    adrp x0, file_buffer@page
+    add x0, x0, file_buffer@pageoff
+    mov x1, x26
+    cmp x1, #0
+    b.ge 2f
+    mov x1, #0
+2:
     bl _set_source
     ldp x25, x26, [sp], #16
     RESTORE_VM
@@ -1639,6 +1662,87 @@ XPAD:
     add x0, x0, pad_buffer@pageoff
     mov x20, x0
     NEXT
+
+// EVALUATE ( c-addr u -- )  nest SOURCE and interpret the string
+XEVALUATE:
+    mov x1, x20                    // u
+    ldr x0, [x22], #8              // c-addr
+    ldr x20, [x22], #8
+    stp x0, x1, [sp, #-16]!        // preserve across _push_source
+    bl _push_source
+    ldp x0, x1, [sp], #16
+    bl _set_source
+    b _interpret_loop
+
+// CATCH ( i*x xt -- j*x 0 | i*x n )
+// R-stack frame (top first): saved_IP, saved_DSP, saved_TOS, prev_handler
+// handler points at saved_IP.
+XCATCH:
+    mov x5, x20                    // xt
+    ldr x20, [x22], #8             // pop xt → prior TOS
+    adrp x7, throw_handler@page
+    add x7, x7, throw_handler@pageoff
+    ldr x2, [x7]
+    str x2, [x23, #-8]!            // prev_handler
+    str x20, [x23, #-8]!           // saved_TOS
+    str x22, [x23, #-8]!           // saved_DSP
+    str x19, [x23, #-8]!           // saved_IP (resume after CATCH)
+    str x23, [x7]                  // handler = &saved_IP
+    // Return trampoline: NEXT after xt → catch_ok entry
+    adrp x0, dict_catch_ok@page
+    add x0, x0, dict_catch_ok@pageoff
+    adrp x1, catch_ok_cell@page
+    add x1, x1, catch_ok_cell@pageoff
+    str x0, [x1]
+    mov x19, x1
+    mov x21, x5
+    ldr x1, [x5, #16]
+    br x1
+
+// Normal completion of CATCH'd xt
+XCATCH_OK:
+    adrp x7, throw_handler@page
+    add x7, x7, throw_handler@pageoff
+    ldr x1, [x7]
+    cbz x1, _cok_push0
+    mov x23, x1
+    ldr x19, [x23], #8             // resume IP
+    add x23, x23, #16              // skip DSP + TOS (keep xt results)
+    ldr x0, [x23], #8              // prev_handler
+    str x0, [x7]
+_cok_push0:
+    str x20, [x22, #-8]!
+    mov x20, #0
+    NEXT
+
+// THROW ( k -- )  0 THROW is a no-op drop; nonzero restores CATCH frame
+XTHROW:
+    cbz x20, _throw_zero
+    mov x5, x20                    // k
+    adrp x7, throw_handler@page
+    add x7, x7, throw_handler@pageoff
+    ldr x1, [x7]
+    cbz x1, _throw_abort
+    mov x23, x1
+    ldr x19, [x23], #8             // IP
+    ldr x22, [x23], #8             // DSP
+    ldr x20, [x23], #8             // TOS
+    ldr x0, [x23], #8              // prev_handler
+    str x0, [x7]
+    str x20, [x22, #-8]!
+    mov x20, x5                    // throw code
+    NEXT
+_throw_zero:
+    ldr x20, [x22], #8
+    NEXT
+_throw_abort:
+    mov x0, #1
+    adrp x1, str_quest@page
+    add x1, x1, str_quest@pageoff
+    mov x2, #2
+    mov x16, #4
+    svc #0x80
+    b _do_quit
 
 // PARSE ( char "ccc<char>" -- c-addr u )
 // From >IN to delimiter or end of SOURCE; consumes delimiter if found.
@@ -2187,7 +2291,7 @@ _quit_loop:
 
 _interpret_loop:
     bl _next_word
-    cbz x1, _interpret_done
+    cbz x1, _interpret_empty
 
     // Save word addr and len on return stack (caller-saved x2/x3 will be clobbered)
     str x0, [x23, #-8]!    // push word addr
@@ -2291,6 +2395,10 @@ _word_not_found:
     bl _putchar
     b _interpret_loop
 
+// End of current SOURCE: pop nested source (INCLUDE/EVALUATE) or finish line
+_interpret_empty:
+    bl _pop_source
+    cbnz x0, _interpret_loop       // restored outer SOURCE — keep going
 _interpret_done:
     // Print " ok" via SVC
     mov x0, #1
@@ -2331,6 +2439,76 @@ _set_source:
     adrp x2, word_cursor@page
     add x2, x2, word_cursor@pageoff
     str x0, [x2]
+    ret
+
+// _push_source: save current SOURCE/>IN on source_stack. Clobbers x0-x3.
+// Returns x0=1 ok, x0=0 overflow.
+_push_source:
+    adrp x0, source_sp@page
+    add x0, x0, source_sp@pageoff
+    ldr x1, [x0]
+    cmp x1, #8
+    b.hs 1f
+    mov x2, #24                    // 3*8 per frame
+    mul x3, x1, x2
+    adrp x2, source_stack@page
+    add x2, x2, source_stack@pageoff
+    add x2, x2, x3
+    // store addr, len, to_in
+    adrp x3, source_addr@page
+    add x3, x3, source_addr@pageoff
+    ldr x3, [x3]
+    str x3, [x2], #8
+    adrp x3, source_len@page
+    add x3, x3, source_len@pageoff
+    ldr x3, [x3]
+    str x3, [x2], #8
+    adrp x3, to_in_var@page
+    add x3, x3, to_in_var@pageoff
+    ldr x3, [x3]
+    str x3, [x2]
+    add x1, x1, #1
+    str x1, [x0]
+    mov x0, #1
+    ret
+1:
+    mov x0, #0
+    ret
+
+// _pop_source: restore SOURCE/>IN. x0=1 ok, x0=0 underflow.
+_pop_source:
+    adrp x0, source_sp@page
+    add x0, x0, source_sp@pageoff
+    ldr x1, [x0]
+    cbz x1, 1f
+    sub x1, x1, #1
+    str x1, [x0]
+    mov x2, #24
+    mul x3, x1, x2
+    adrp x2, source_stack@page
+    add x2, x2, source_stack@pageoff
+    add x2, x2, x3
+    ldr x3, [x2], #8
+    adrp x0, source_addr@page
+    add x0, x0, source_addr@pageoff
+    str x3, [x0]
+    mov x4, x3                     // base for cursor
+    ldr x3, [x2], #8
+    adrp x0, source_len@page
+    add x0, x0, source_len@pageoff
+    str x3, [x0]
+    ldr x3, [x2]
+    adrp x0, to_in_var@page
+    add x0, x0, to_in_var@pageoff
+    str x3, [x0]
+    add x4, x4, x3
+    adrp x0, word_cursor@page
+    add x0, x0, word_cursor@pageoff
+    str x4, [x0]
+    mov x0, #1
+    ret
+1:
+    mov x0, #0
     ret
 
 // _cursor_load: -> x0 = absolute parse pointer (SOURCE + >IN)
@@ -2495,15 +2673,21 @@ _rl_done:
     ret
 
 // _next_word: parse next word -> x0=addr of word_scratch, x1=length (0=done)
+// Stops at SOURCE end (not only NUL) so EVALUATE substrings work.
 _next_word:
     stp x29, x30, [sp, #-16]!
     mov x29, sp
     stp x19, x20, [sp, #-16]!
+    stp x21, x22, [sp, #-16]!
 
     bl _cursor_load
     mov x19, x0
+    bl _source_end
+    mov x21, x0                    // end of SOURCE
 
 _nw_skip:
+    cmp x19, x21
+    b.hs _nw_eof
     ldrb w0, [x19]
     cbz w0, _nw_eof
     cmp w0, #32
@@ -2520,6 +2704,8 @@ _nw_adv:
 _nw_start:
     mov x20, x19
 _nw_scan:
+    cmp x19, x21
+    b.hs _nw_got
     ldrb w0, [x19]
     cbz w0, _nw_got
     cmp w0, #32
@@ -2556,6 +2742,7 @@ _nw_copied:
     ldp x1, x2, [sp], #16
 
     mov x0, x2
+    ldp x21, x22, [sp], #16
     ldp x19, x20, [sp], #16
     ldp x29, x30, [sp], #16
     ret
@@ -2563,6 +2750,7 @@ _nw_copied:
 _nw_eof:
     mov x0, #0
     mov x1, #0
+    ldp x21, x22, [sp], #16
     ldp x19, x20, [sp], #16
     ldp x29, x30, [sp], #16
     ret
@@ -2925,6 +3113,10 @@ source_len:     .quad 0
 to_in_var:      .quad 0
 pad_buffer:     .skip 256
 hold_ptr:       .quad 0
+// Nested SOURCE stack: 8 frames * 3 quads (addr, len, >IN)
+source_stack:   .skip 192
+source_sp:      .quad 0
+throw_handler:  .quad 0
 
 str_hello:  .asciz "PickleForth v0.1\n"
 str_prompt: .asciz "\nok> "
@@ -3024,6 +3216,19 @@ forth_init_str:
     // FILL ( c-addr u char -- ); stack top is u, so bump addr via SWAP 1+ SWAP
     .ascii ": FILL >R BEGIN DUP WHILE OVER R@ SWAP C! SWAP 1+ SWAP 1- REPEAT R> DROP 2DROP ; "
     .ascii ": ERASE 0 FILL ; "
+    // MOVE / CMOVE (ANS character/cell move; MOVE handles overlap)
+    .ascii ": CMOVE BEGIN DUP WHILE >R OVER C@ OVER C! CHAR+ SWAP CHAR+ SWAP R> 1- REPEAT DROP 2DROP ; "
+    .ascii ": CMOVE> DUP >R + 1- SWAP R@ + 1- SWAP R> BEGIN DUP WHILE >R OVER C@ OVER C! 1- SWAP 1- SWAP R> 1- REPEAT DROP 2DROP ; "
+    .ascii ": MOVE DUP 0= IF DROP 2DROP EXIT THEN >R 2DUP U< IF R> CMOVE> ELSE R> CMOVE THEN ; "
+
+    // POSTPONE (ANS): imm → compile xt; non-imm → compile LIT xt ,
+    .ascii ": POSTPONE BL WORD FIND DUP 0= IF 2DROP EXIT THEN 1 = IF , ELSE LIT-ADDR , , ['] , , THEN ; IMMEDIATE "
+
+    // CASE OF ENDOF ENDCASE (ANS-style)
+    .ascii ": CASE 0 ; IMMEDIATE "
+    .ascii ": OF 1+ >R POSTPONE OVER POSTPONE = POSTPONE IF POSTPONE DROP R> ; IMMEDIATE "
+    .ascii ": ENDOF >R POSTPONE ELSE R> ; IMMEDIATE "
+    .ascii ": ENDCASE POSTPONE DROP BEGIN DUP WHILE 1- >R POSTPONE THEN R> REPEAT DROP ; IMMEDIATE "
 
     // --- 5. Tools / extensions ---
     .ascii ": WORDS LATEST @ BEGIN DUP WHILE DUP NAME>STRING TYPE SPACE @ REPEAT DROP CR ; "
@@ -3049,6 +3254,7 @@ dict_restart_end:
 .align 8
 restart_cell:   .quad 0
 next_diag:      .skip 32  // x5, x19, x22, x20 for crash debugging
+catch_ok_cell:  .quad 0
     .quad dict_restart          // cell IP points to when executing from REPL
 
 // ============================================================================
@@ -3860,6 +4066,37 @@ dict_does:  // DOES> ( -- ) IMMEDIATE
     .asciz "DOES>"
     .space 3
 
+.align 8
+dict_evaluate:  // EVALUATE ( c-addr u -- ) ANS
+    .quad dict_does
+    .quad 8
+    .quad XEVALUATE
+    .asciz "EVALUATE"
+    .space 8
+
+.align 8
+dict_catch:  // CATCH ( i*x xt -- j*x 0 | i*x n ) ANS
+    .quad dict_evaluate
+    .quad 5
+    .quad XCATCH
+    .asciz "CATCH"
+    .space 3
+
+.align 8
+dict_throw:  // THROW ( k -- ) ANS
+    .quad dict_catch
+    .quad 5
+    .quad XTHROW
+    .asciz "THROW"
+    .space 3
+
+.align 8
+dict_catch_ok:  // (CATCH-OK) internal
+    .quad dict_throw
+    .quad 10
+    .quad XCATCH_OK
+    .asciz "(CATCH-OK)"
+    .space 6
 
 // ============================================================================
 // User dictionary space (grows upward)
