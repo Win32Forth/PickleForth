@@ -65,12 +65,15 @@
 // Still missing major ANS Core pieces:
 //   EVALUATE REFILL
 //   C"  MOVE CMOVE
-//   VALUE TO DOES> POSTPONE
-//   Pictured numeric output <# # #S #> HOLD SIGN  >NUMBER
-//   DO LOOP +LOOP I J LEAVE UNLOOP  CASE OF ENDOF ENDCASE
+//   VALUE TO POSTPONE
+//   >NUMBER  (pictured <# # #S #> HOLD SIGN PAD done)
+//   CASE OF ENDOF ENDCASE
 //   CATCH THROW  ENVIRONMENT?
 //
-// Batch-1 done: S" ."  ANS FIND  SOURCE  >IN
+// Batch-1: S" ."  ANS FIND  SOURCE  >IN
+// Batch-2: DO LOOP +LOOP I J LEAVE UNLOOP  DOES>  pictured numeric
+//   Note: DO/LOOP are compilation words (use inside : defs). CREATE body is
+//   does_ip at +0, user PFA at +8 (DOVAR/DODOES/DOCON aware).
 //
 // Implementation notes:
 //   - Indirect threaded; compiled cells are dictionary entry addresses
@@ -164,8 +167,8 @@ _main:
     mov  x20, #0
 
     // Initialize latest_var to newest static word
-    adrp x0, dict_dotquote@page
-    add  x0, x0, dict_dotquote@pageoff
+    adrp x0, dict_does@page
+    add  x0, x0, dict_does@pageoff
     str  x0, [x24]
 
     // HERE = user_dict_area
@@ -225,14 +228,26 @@ DOEXIT:
     NEXT
 
 DOVAR:
+    // PFA = body+8 (body+0 reserved for does_ip)
     str x20, [x22, #-8]!
     DICT_BODY_ADDR x20, x21
+    add x20, x20, #8
     NEXT
 
 DOCON:
     str x20, [x22, #-8]!
     DICT_BODY_ADDR x0, x21
-    ldr x20, [x0]
+    ldr x20, [x0, #8]              // value at user PFA
+    NEXT
+
+// DODOES: push PFA (body+8), run high-level fragment at [body+0]
+DODOES:
+    RPUSH
+    DICT_BODY_ADDR x0, x21
+    ldr x19, [x0]                  // does_ip
+    add x0, x0, #8                 // PFA
+    str x20, [x22, #-8]!
+    mov x20, x0
     NEXT
 
 // ============================================================================
@@ -623,6 +638,47 @@ _patch_dict:
     PATCH_LINK dict_dotquote, dict_squote
     nop
     PATCH_CODE dict_dotquote, XDOTQ
+    nop
+    // DO LOOP family + DOES>
+    PATCH_LINK dict_do_rt, dict_dotquote
+    nop
+    PATCH_CODE dict_do_rt, XDO_RT
+    nop
+    PATCH_LINK dict_loop_rt, dict_do_rt
+    nop
+    PATCH_CODE dict_loop_rt, XLOOP_RT
+    nop
+    PATCH_LINK dict_ploop_rt, dict_loop_rt
+    nop
+    PATCH_CODE dict_ploop_rt, XPLUSLOOP_RT
+    nop
+    PATCH_LINK dict_i, dict_ploop_rt
+    nop
+    PATCH_CODE dict_i, XI
+    nop
+    PATCH_LINK dict_j, dict_i
+    nop
+    PATCH_CODE dict_j, XJ
+    nop
+    PATCH_LINK dict_unloop, dict_j
+    nop
+    PATCH_CODE dict_unloop, XUNLOOP
+    nop
+    PATCH_LINK dict_leave, dict_unloop
+    nop
+    PATCH_CODE dict_leave, XLEAVE
+    nop
+    PATCH_LINK dict_does_rt, dict_leave
+    nop
+    PATCH_CODE dict_does_rt, XDOES_RT
+    nop
+    PATCH_LINK dict_pad, dict_does_rt
+    nop
+    PATCH_CODE dict_pad, XPAD
+    nop
+    PATCH_LINK dict_does, dict_pad
+    nop
+    PATCH_CODE dict_does, XDOES
     nop
 
     .purgem PATCH_CODE
@@ -1236,6 +1292,8 @@ _create_pad_loop:
     b _create_pad_loop
 _create_name_done:
     add x0, x0, x2
+    // Reserve does_ip cell at body+0; user PFA starts at body+8
+    str xzr, [x0], #8
     // Update HERE
     adrp x1, here_ptr@page
     add x1, x1, here_ptr@pageoff
@@ -1461,6 +1519,124 @@ XDOCON_ADDR:
     DPUSH
     adrp x0, DOCON@page
     add x0, x0, DOCON@pageoff
+    mov x20, x0
+    NEXT
+
+// ============================================================================
+// DO / LOOP family  (R: limit index  with index on top)
+// ============================================================================
+
+// (DO) ( limit index -- )  R: -- limit index
+XDO_RT:
+    ldr x0, [x22], #8              // limit
+    str x0, [x23, #-8]!            // R: limit
+    str x20, [x23, #-8]!           // R: limit index
+    ldr x20, [x22], #8
+    NEXT
+
+// (LOOP) ( -- )  increment index; branch by offset if not done
+// LEAVE sets index=limit so first cmp exits.
+XLOOP_RT:
+    ldr x0, [x23], #8              // index
+    ldr x1, [x23], #8              // limit
+    cmp x0, x1
+    b.ge _loop_done                // LEAVE or finished
+    add x0, x0, #1
+    cmp x0, x1
+    b.eq _loop_done
+    str x1, [x23, #-8]!
+    str x0, [x23, #-8]!
+    ldr x2, [x19]
+    add x19, x19, x2
+    NEXT
+_loop_done:
+    add x19, x19, #8               // skip offset
+    NEXT
+
+// (+LOOP) ( n -- )
+XPLUSLOOP_RT:
+    ldr x0, [x23], #8              // index
+    ldr x1, [x23], #8              // limit
+    mov x2, x20                    // step n
+    ldr x20, [x22], #8
+    cmp x0, x1
+    b.eq _pl_done                  // LEAVE: index == limit
+    mov x3, x0                     // old index
+    add x0, x0, x2                 // new index
+    cmp x2, #0
+    b.lt _pl_neg
+    // n >= 0: done if old < limit && new >= limit
+    cmp x3, x1
+    b.ge _pl_cont
+    cmp x0, x1
+    b.ge _pl_done
+    b _pl_cont
+_pl_neg:
+    cmp x3, x1
+    b.lt _pl_cont
+    cmp x0, x1
+    b.lt _pl_done
+_pl_cont:
+    str x1, [x23, #-8]!
+    str x0, [x23, #-8]!
+    ldr x2, [x19]
+    add x19, x19, x2
+    NEXT
+_pl_done:
+    add x19, x19, #8
+    NEXT
+
+// I ( -- n )  current loop index
+XI:
+    str x20, [x22, #-8]!
+    ldr x20, [x23]
+    NEXT
+
+// J ( -- n )  outer loop index
+XJ:
+    str x20, [x22, #-8]!
+    ldr x20, [x23, #16]            // skip inner index+limit
+    NEXT
+
+// UNLOOP ( -- )  R: limit index --
+XUNLOOP:
+    add x23, x23, #16
+    NEXT
+
+// LEAVE ( -- )  set index=limit so LOOP/+LOOP exit
+XLEAVE:
+    ldr x0, [x23, #8]              // limit
+    str x0, [x23]                  // index = limit
+    NEXT
+
+// (DOES>) ( -- ) runtime of DOES>: patch LATEST, then EXIT defining word
+XDOES_RT:
+    ldr x0, [x24]                  // latest entry
+    adrp x1, DODOES@page
+    add x1, x1, DODOES@pageoff
+    str x1, [x0, #16]              // code field = DODOES
+    // body[0] = does_ip (x19 points at first word of does-clause)
+    DICT_BODY_ADDR x1, x0
+    str x19, [x1]
+    // EXIT defining word
+    RPOP
+    NEXT
+
+// DOES> ( -- ) IMMEDIATE  compile (DOES>)
+XDOES:
+    adrp x0, dict_does_rt@page
+    add x0, x0, dict_does_rt@pageoff
+    bl _compile_cell
+    NEXT
+
+// ============================================================================
+// Pictured numeric output support
+// ============================================================================
+// PAD ( -- c-addr )
+XPAD:
+    str x20, [x22, #-8]!
+    adrp x0, pad_buffer@page
+    add x0, x0, pad_buffer@pageoff
     mov x20, x0
     NEXT
 
@@ -2746,6 +2922,8 @@ word_cursor:    .quad 0
 source_addr:    .quad 0
 source_len:     .quad 0
 to_in_var:      .quad 0
+pad_buffer:     .skip 256
+hold_ptr:       .quad 0
 
 str_hello:  .asciz "PickleForth v0.1\n"
 str_prompt: .asciz "\nok> "
@@ -2818,13 +2996,30 @@ forth_init_str:
     .ascii ": ELSE BRANCH-ADDR , HERE 0 , SWAP HERE OVER - SWAP ! ; IMMEDIATE "
     .ascii ": WHILE 0BRANCH-ADDR , HERE 0 , ; IMMEDIATE "
     .ascii ": REPEAT BRANCH-ADDR , SWAP HERE - , HERE OVER - SWAP ! ; IMMEDIATE "
+    // DO/LOOP: ( limit start -- ) ... LOOP    classic Forth order: limit first
+    .ascii ": DO ['] (DO) , HERE ; IMMEDIATE "
+    .ascii ": LOOP ['] (LOOP) , HERE - , ; IMMEDIATE "
+    .ascii ": +LOOP ['] (+LOOP) , HERE - , ; IMMEDIATE "
 
     // --- 4. Defining words / parse helpers using the above ---
     .ascii ": CHAR BL WORD COUNT DROP C@ ; "
     .ascii ": [CHAR] CHAR LIT-ADDR , , ; IMMEDIATE "
     .ascii ": VARIABLE CREATE 0 , ; "
-    .ascii ": CONSTANT CREATE , DOCON-ADDR LATEST @ >CODE ! ; "
+    // CONSTANT via DOES> (body+0=does_ip, body+8=value; DOES> action @ )
+    .ascii ": CONSTANT CREATE , DOES> @ ; "
     .ascii ": RECURSE LATEST @ , ; IMMEDIATE "
+
+    // --- 4b. Pictured numeric output (single-cell); . and U. stay native (BASE-aware) ---
+    .ascii "VARIABLE HLD "
+    .ascii ": <# PAD 256 + HLD ! ; "
+    .ascii ": HOLD -1 HLD +! HLD @ C! ; "
+    .ascii ": #> DROP HLD @ PAD 256 + OVER - ; "
+    .ascii ": # BASE @ /MOD SWAP DUP 9 > IF 7 + THEN 48 + HOLD ; "
+    .ascii ": #S BEGIN # DUP 0= UNTIL ; "
+    .ascii ": SIGN 0< IF 45 HOLD THEN ; "
+    // Formatted print using pictured output (native . / U. remain)
+    .ascii ": UD. <# #S #> TYPE SPACE ; "
+    .ascii ": D. DUP 0< IF NEGATE <# #S 45 HOLD #> ELSE <# #S #> THEN TYPE SPACE ; "
     // FILL ( c-addr u char -- ); stack top is u, so bump addr via SWAP 1+ SWAP
     .ascii ": FILL >R BEGIN DUP WHILE OVER R@ SWAP C! SWAP 1+ SWAP 1- REPEAT R> DROP 2DROP ; "
     .ascii ": ERASE 0 FILL ; "
@@ -3582,6 +3777,88 @@ dict_dotquote:  // ." ( -- ) IMMEDIATE ANS
     .quad XDOTQ
     .byte 46, 34                    // ."
     .space 6
+
+
+.align 8
+dict_do_rt:  // (DO) ( limit index -- ) R: -- limit index
+    .quad dict_dotquote
+    .quad 4
+    .quad XDO_RT
+    .asciz "(DO)"
+    .space 4
+
+.align 8
+dict_loop_rt:  // (LOOP) ( -- )
+    .quad dict_do_rt
+    .quad 6
+    .quad XLOOP_RT
+    .asciz "(LOOP)"
+    .space 2
+
+.align 8
+dict_ploop_rt:  // (+LOOP) ( n -- )
+    .quad dict_loop_rt
+    .quad 7
+    .quad XPLUSLOOP_RT
+    .asciz "(+LOOP)"
+    .space 1
+
+.align 8
+dict_i:  // I ( -- n )
+    .quad dict_ploop_rt
+    .quad 1
+    .quad XI
+    .byte 73
+    .space 7
+
+.align 8
+dict_j:  // J ( -- n )
+    .quad dict_i
+    .quad 1
+    .quad XJ
+    .byte 74
+    .space 7
+
+.align 8
+dict_unloop:  // UNLOOP ( -- )
+    .quad dict_j
+    .quad 6
+    .quad XUNLOOP
+    .asciz "UNLOOP"
+    .space 2
+
+.align 8
+dict_leave:  // LEAVE ( -- )
+    .quad dict_unloop
+    .quad 5
+    .quad XLEAVE
+    .asciz "LEAVE"
+    .space 3
+
+.align 8
+dict_does_rt:  // (DOES>) ( -- )
+    .quad dict_leave
+    .quad 7
+    .quad XDOES_RT
+    .asciz "(DOES>)"
+    .space 1
+
+.align 8
+dict_pad:  // PAD ( -- c-addr )
+    .quad dict_does_rt
+    .quad 3
+    .quad XPAD
+    .asciz "PAD"
+    .space 5
+
+.align 8
+dict_does:  // DOES> ( -- ) IMMEDIATE
+    .quad dict_pad
+    .quad 0x105
+    .quad XDOES
+    .asciz "DOES>"
+    .space 3
+
 
 // ============================================================================
 // User dictionary space (grows upward)
