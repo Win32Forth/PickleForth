@@ -53,7 +53,7 @@
 //   Control: IF ELSE THEN BEGIN UNTIL AGAIN WHILE REPEAT EXIT
 //
 // Present but non-ANS or different (fix later):
-//   FIND     — we use ( c-addr u ); ANS FIND uses counted string only
+//   FIND     — ANS shape (counted string; 1=imm / -1=non-imm / 0=missing)
 //   ' / xt   — xt is dictionary entry address (ANS xt is opaque)
 //   >BODY    — also used for colon bodies (ANS: CREATE words)
 //   >CODE >NAME >FLAGS >LINK NAME>STRING DOCOL? DOCON-ADDR — extensions
@@ -63,12 +63,14 @@
 //   CELL     — push 8; not an ANS word (CELL+ / CELLS are ANS)
 //
 // Still missing major ANS Core pieces:
-//   SOURCE >IN EVALUATE REFILL
-//   S" ." C"  MOVE CMOVE
+//   EVALUATE REFILL
+//   C"  MOVE CMOVE
 //   VALUE TO DOES> POSTPONE
 //   Pictured numeric output <# # #S #> HOLD SIGN  >NUMBER
 //   DO LOOP +LOOP I J LEAVE UNLOOP  CASE OF ENDOF ENDCASE
 //   CATCH THROW  ENVIRONMENT?
+//
+// Batch-1 done: S" ."  ANS FIND  SOURCE  >IN
 //
 // Implementation notes:
 //   - Indirect threaded; compiled cells are dictionary entry addresses
@@ -162,8 +164,8 @@ _main:
     mov  x20, #0
 
     // Initialize latest_var to newest static word
-    adrp x0, dict_docon_addr@page
-    add  x0, x0, dict_docon_addr@pageoff
+    adrp x0, dict_dotquote@page
+    add  x0, x0, dict_dotquote@pageoff
     str  x0, [x24]
 
     // HERE = user_dict_area
@@ -184,16 +186,19 @@ _main:
     mov x16, #4
     svc #0x80
 
-    // Initialize Forth from init string
-    // Set word_cursor to init string
-    adrp x0, word_cursor@page
-    add x0, x0, word_cursor@pageoff
-    adrp x1, forth_init_str@page
-    add x1, x1, forth_init_str@pageoff
-    str x1, [x0]
-    
-    // Jump to interpreter loop to process init string
-    // When done, it will print "ok" and go to _quit_loop (REPL)
+    // Initialize Forth from init string via SOURCE / >IN
+    adrp x0, forth_init_str@page
+    add x0, x0, forth_init_str@pageoff
+    mov x1, x0
+    mov x2, #0
+1:
+    ldrb w3, [x1, x2]
+    cbz w3, 2f
+    add x2, x2, #1
+    b 1b
+2:
+    mov x1, x2                      // len
+    bl _set_source
     b _interpret_loop
 
 // ============================================================================
@@ -599,6 +604,26 @@ _patch_dict:
     nop
     PATCH_CODE dict_docon_addr, XDOCON_ADDR
     nop
+    PATCH_LINK dict_source, dict_docon_addr
+    nop
+    PATCH_CODE dict_source, XSOURCE
+    nop
+    PATCH_LINK dict_to_in, dict_source
+    nop
+    PATCH_CODE dict_to_in, XTOIN
+    nop
+    PATCH_LINK dict_slit, dict_to_in
+    nop
+    PATCH_CODE dict_slit, XSLIT
+    nop
+    PATCH_LINK dict_squote, dict_slit
+    nop
+    PATCH_CODE dict_squote, XSQUOTE
+    nop
+    PATCH_LINK dict_dotquote, dict_squote
+    nop
+    PATCH_CODE dict_dotquote, XDOTQ
+    nop
 
     .purgem PATCH_CODE
     .purgem PATCH_LINK
@@ -988,20 +1013,26 @@ XCOMMA:
     bl _compile_cell
     NEXT
 
-// FIND ( addr u -- xt -1 | addr u 0 ) find word in dictionary
-// Stack: TOS=u, second=addr
+// FIND ( c-addr -- c-addr 0 | xt 1 | xt -1 )  ANS Core
+// c-addr is a counted string. 1 = immediate, -1 = non-immediate.
 XFIND:
-    mov x1, x20        // x1 = u
-    ldr x0, [x22]      // x0 = addr
+    mov x2, x20                 // c-addr (counted)
+    ldrb w1, [x2]               // u = count
+    add x0, x2, #1              // address of name chars
     bl _find_word
     cbz x0, _xfind_not
-    // Found: ( xt -1 )
-    str x0, [x22]      // replace addr with xt
-    mov x20, #-1
+    // x0 = entry; reload flags (x1 may be ok from _find_word)
+    ldr x1, [x0, #8]
+    tst x1, #0x100
+    mov x4, #1
+    mov x5, #-1
+    csel x4, x4, x5, ne         // immediate -> 1, else -1
+    mov x20, x0                 // xt
+    str x20, [x22, #-8]!
+    mov x20, x4                 // flag
     NEXT
 _xfind_not:
-    // Not found: ( addr u 0 )
-    str x20, [x22, #-8]!   // push u under TOS
+    str x20, [x22, #-8]!        // c-addr under 0
     mov x20, #0
     NEXT
 
@@ -1303,14 +1334,17 @@ XINCLUDE:
     strb wzr, [x0]
 
 _include_done_restore:
+    // set SOURCE before restoring VM so x26 length is available
+    adrp x0, file_buffer@page
+    add x0, x0, file_buffer@pageoff
+    mov x1, x26
+    cmp x1, #0
+    b.ge 1f
+    mov x1, #0
+1:
+    bl _set_source
     ldp x25, x26, [sp], #16
     RESTORE_VM
-    // Set word_cursor to file_buffer
-    adrp x0, word_cursor@page
-    add x0, x0, word_cursor@pageoff
-    adrp x1, file_buffer@page
-    add x1, x1, file_buffer@pageoff
-    str x1, [x0]
     NEXT
 
 _include_fail_restore:
@@ -1431,15 +1465,18 @@ XDOCON_ADDR:
     NEXT
 
 // PARSE ( char "ccc<char>" -- c-addr u )
-// From word_cursor to delimiter or end; consumes delimiter if found.
+// From >IN to delimiter or end of SOURCE; consumes delimiter if found.
 // Does not skip leading delimiters (ANS PARSE).
 XPARSE:
     mov w7, w20                     // delimiter
-    adrp x0, word_cursor@page
-    add x0, x0, word_cursor@pageoff
-    ldr x2, [x0]                    // c-addr = start
-    mov x3, x2
+    bl _cursor_load
+    mov x9, x0                      // c-addr = start (x9 not clobbered by helpers)
+    mov x3, x9
+    bl _source_end
+    mov x6, x0                      // end
 _parse_scan:
+    cmp x3, x6
+    b.hs _parse_eos
     ldrb w4, [x3]
     cbz w4, _parse_eos
     cmp w4, w7
@@ -1447,16 +1484,17 @@ _parse_scan:
     add x3, x3, #1
     b _parse_scan
 _parse_found:
-    sub x5, x3, x2                  // u
+    sub x5, x3, x9                  // u
     add x3, x3, #1                  // skip delimiter
-    str x3, [x0]
+    mov x0, x3
+    bl _cursor_store
     b _parse_push
 _parse_eos:
-    sub x5, x3, x2
-    str x3, [x0]
+    sub x5, x3, x9
+    mov x0, x3
+    bl _cursor_store
 _parse_push:
-    // Replace char (TOS) with c-addr, then push u
-    mov x20, x2
+    mov x20, x9
     str x20, [x22, #-8]!
     mov x20, x5
     NEXT
@@ -1466,15 +1504,17 @@ _parse_push:
 // in word_scratch (transient). Space delimiter also skips TAB/CR/LF.
 XWORD:
     mov w7, w20                     // delimiter
-    adrp x0, word_cursor@page
-    add x0, x0, word_cursor@pageoff
-    ldr x2, [x0]
+    bl _cursor_load
+    mov x2, x0
+    bl _source_end
+    mov x9, x0                      // end of SOURCE
 _word_skip:
+    cmp x2, x9
+    b.hs _word_empty
     ldrb w4, [x2]
     cbz w4, _word_empty
     cmp w7, #32
     b.ne _word_skip_exact
-    // space: skip space/tab/cr/lf
     cmp w4, #32
     b.eq _word_skip_adv
     cmp w4, #9
@@ -1493,6 +1533,8 @@ _word_skip_adv:
 _word_start:
     mov x3, x2                      // start of token
 _word_scan:
+    cmp x2, x9
+    b.hs _word_end
     ldrb w4, [x2]
     cbz w4, _word_end
     cmp w7, #32
@@ -1514,20 +1556,26 @@ _word_scan_exact:
     b _word_scan
 _word_end:
     sub x5, x2, x3                  // length
-    // if ended on delimiter (not NUL), consume it
+    cmp x2, x9
+    b.hs _word_store
     ldrb w4, [x2]
     cbz w4, _word_store
-    add x2, x2, #1
+    add x2, x2, #1                  // consume delimiter
 _word_store:
-    str x2, [x0]                    // update cursor
-    // counted string at word_scratch: max 63 chars
+    // Save token start/len across _cursor_store (clobbers x0-x3)
+    mov x6, x3                      // token start
+    mov x7, x5                      // len
+    mov x0, x2
+    bl _cursor_store
+    mov x3, x6
+    mov x5, x7
     cmp x5, #63
     b.ls _word_len_ok
     mov x5, #63
 _word_len_ok:
     adrp x6, word_scratch@page
     add x6, x6, word_scratch@pageoff
-    strb w5, [x6]                   // count byte
+    strb w5, [x6]
     mov x1, #0
 _word_copy:
     cmp x1, x5
@@ -1538,10 +1586,11 @@ _word_copy:
     add x1, x1, #1
     b _word_copy
 _word_done:
-    mov x20, x6                     // c-addr of counted string
+    mov x20, x6
     NEXT
 _word_empty:
-    str x2, [x0]
+    mov x0, x2
+    bl _cursor_store
     adrp x6, word_scratch@page
     add x6, x6, word_scratch@pageoff
     strb wzr, [x6]
@@ -1550,10 +1599,13 @@ _word_empty:
 
 // \ ( -- ) IMMEDIATE  discard rest of parse area (to end of line)
 XBACKSLASH:
-    adrp x0, word_cursor@page
-    add x0, x0, word_cursor@pageoff
-    ldr x1, [x0]
+    bl _cursor_load
+    mov x1, x0
+    bl _source_end
+    mov x9, x0
 _bs_loop:
+    cmp x1, x9
+    b.hs _bs_done
     ldrb w2, [x1]
     cbz w2, _bs_done
     cmp w2, #10
@@ -1561,26 +1613,360 @@ _bs_loop:
     add x1, x1, #1
     b _bs_loop
 _bs_done:
-    str x1, [x0]
+    mov x0, x1
+    bl _cursor_store
     NEXT
 
 // ( ( -- ) IMMEDIATE  paren comment; discard until ')'
 XPAREN:
-    adrp x0, word_cursor@page
-    add x0, x0, word_cursor@pageoff
-    ldr x1, [x0]
+    bl _cursor_load
+    mov x1, x0
+    bl _source_end
+    mov x9, x0
 _par_loop:
+    cmp x1, x9
+    b.hs _par_done
     ldrb w2, [x1]
     cbz w2, _par_done
-    cmp w2, #41                     // ')'
+    cmp w2, #41
     b.eq _par_found
     add x1, x1, #1
     b _par_loop
 _par_found:
-    add x1, x1, #1                  // skip ')'
+    add x1, x1, #1
 _par_done:
-    str x1, [x0]
+    mov x0, x1
+    bl _cursor_store
     NEXT
+
+// SOURCE ( -- c-addr u )  ANS
+XSOURCE:
+    str x20, [x22, #-8]!
+    adrp x0, source_addr@page
+    add x0, x0, source_addr@pageoff
+    ldr x20, [x0]
+    str x20, [x22, #-8]!
+    adrp x0, source_len@page
+    add x0, x0, source_len@pageoff
+    ldr x20, [x0]
+    NEXT
+
+// >IN ( -- a-addr )  ANS variable
+XTOIN:
+    str x20, [x22, #-8]!
+    adrp x0, to_in_var@page
+    add x0, x0, to_in_var@pageoff
+    mov x20, x0
+    NEXT
+
+// (S") ( -- c-addr u )  runtime for compiled S" / ."
+// In-line layout at IP:  cell len, then len bytes, then pad to 8.
+XSLIT:
+    ldr x0, [x19], #8               // length
+    str x20, [x22, #-8]!
+    mov x20, x19                    // c-addr of string bytes
+    str x20, [x22, #-8]!
+    mov x20, x0                     // u
+    add x19, x19, x0
+    add x19, x19, #7
+    bic x19, x19, #7
+    NEXT
+
+// S" ( -- c-addr u | compile-time ) IMMEDIATE
+// Parse is fully inlined so we never clobber VM regs via nested helpers.
+XSQUOTE:
+    // --- skip blanks; parse to " ---
+    adrp x0, source_addr@page
+    add x0, x0, source_addr@pageoff
+    ldr x9, [x0]                    // SOURCE base
+    adrp x0, to_in_var@page
+    add x0, x0, to_in_var@pageoff
+    mov x10, x0                     // & >IN
+    ldr x11, [x10]                  // >IN
+    adrp x0, source_len@page
+    add x0, x0, source_len@pageoff
+    ldr x12, [x0]                   // SOURCE len
+    add x1, x9, x11                 // cursor
+    add x6, x9, x12                 // end
+_sq_skip:
+    cmp x1, x6
+    b.hs _sq_body0
+    ldrb w2, [x1]
+    cmp w2, #32
+    b.eq _sq_sk1
+    cmp w2, #9
+    b.ne _sq_body0
+_sq_sk1:
+    add x1, x1, #1
+    b _sq_skip
+_sq_body0:
+    mov x2, x1                      // c-addr
+_sq_scan:
+    cmp x1, x6
+    b.hs _sq_eos
+    ldrb w3, [x1]
+    cbz w3, _sq_eos
+    cmp w3, #34
+    b.eq _sq_found
+    add x1, x1, #1
+    b _sq_scan
+_sq_found:
+    sub x5, x1, x2                  // u
+    add x1, x1, #1
+    b _sq_commit
+_sq_eos:
+    sub x5, x1, x2
+_sq_commit:
+    sub x11, x1, x9
+    str x11, [x10]                  // >IN
+    adrp x0, word_cursor@page
+    add x0, x0, word_cursor@pageoff
+    str x1, [x0]
+    // x2=c-addr, x5=u  (x9-x12 free again except we keep x2,x5)
+    adrp x0, state_var@page
+    add x0, x0, state_var@pageoff
+    ldr x0, [x0]
+    cbnz x0, _sq_comp
+    // interpret: ( c-addr u )
+    str x20, [x22, #-8]!
+    mov x20, x2
+    str x20, [x22, #-8]!
+    mov x20, x5
+    NEXT
+_sq_comp:
+    // Compile (S") , len , bytes , align.  x2=c-addr x5=u; save IP on R stack.
+    str x19, [x23, #-8]!            // RPUSH IP
+    str x2, [x23, #-8]!             // save c-addr
+    str x5, [x23, #-8]!             // save u
+    adrp x0, dict_slit@page
+    add x0, x0, dict_slit@pageoff
+    bl _compile_cell
+    ldr x0, [x23]                   // peek u
+    bl _compile_cell
+    // copy u bytes from c-addr to HERE
+    ldr x5, [x23], #8               // pop u
+    ldr x2, [x23], #8               // pop c-addr
+    adrp x0, here_ptr@page
+    add x0, x0, here_ptr@pageoff
+    ldr x1, [x0]                    // dest
+    mov x3, #0
+_sq_cpy:
+    cmp x3, x5
+    b.ge _sq_al
+    ldrb w4, [x2, x3]
+    strb w4, [x1, x3]
+    add x3, x3, #1
+    b _sq_cpy
+_sq_al:
+    add x1, x1, x5
+    add x1, x1, #7
+    bic x1, x1, #7
+    adrp x0, here_ptr@page
+    add x0, x0, here_ptr@pageoff
+    str x1, [x0]
+    ldr x19, [x23], #8              // RPOP IP
+    NEXT
+
+// ." ( -- ) IMMEDIATE
+XDOTQ:
+    // Reuse S" logic by calling the same parse, then TYPE or compile TYPE
+    // Implement by branching into shared structure via stack trick:
+    // For simplicity, duplicate parse (same as S") then diverge.
+    adrp x0, source_addr@page
+    add x0, x0, source_addr@pageoff
+    ldr x9, [x0]
+    adrp x0, to_in_var@page
+    add x0, x0, to_in_var@pageoff
+    mov x10, x0
+    ldr x11, [x10]
+    adrp x0, source_len@page
+    add x0, x0, source_len@pageoff
+    ldr x12, [x0]
+    add x1, x9, x11
+    add x6, x9, x12
+_dq_skip:
+    cmp x1, x6
+    b.hs _dq_body0
+    ldrb w2, [x1]
+    cmp w2, #32
+    b.eq _dq_sk1
+    cmp w2, #9
+    b.ne _dq_body0
+_dq_sk1:
+    add x1, x1, #1
+    b _dq_skip
+_dq_body0:
+    mov x2, x1
+_dq_scan:
+    cmp x1, x6
+    b.hs _dq_eos
+    ldrb w3, [x1]
+    cbz w3, _dq_eos
+    cmp w3, #34
+    b.eq _dq_found
+    add x1, x1, #1
+    b _dq_scan
+_dq_found:
+    sub x5, x1, x2
+    add x1, x1, #1
+    b _dq_commit
+_dq_eos:
+    sub x5, x1, x2
+_dq_commit:
+    sub x11, x1, x9
+    str x11, [x10]
+    adrp x0, word_cursor@page
+    add x0, x0, word_cursor@pageoff
+    str x1, [x0]
+    adrp x0, state_var@page
+    add x0, x0, state_var@pageoff
+    ldr x0, [x0]
+    cbnz x0, _dq_comp
+    // interpret: write string to stdout
+    mov x1, x2
+    mov x2, x5
+    cbz x2, _dq_out
+    mov x0, #1
+    mov x16, #4
+    svc #0x80
+_dq_out:
+    NEXT
+_dq_comp:
+    str x19, [x23, #-8]!
+    str x2, [x23, #-8]!
+    str x5, [x23, #-8]!
+    adrp x0, dict_slit@page
+    add x0, x0, dict_slit@pageoff
+    bl _compile_cell
+    ldr x0, [x23]
+    bl _compile_cell
+    ldr x5, [x23], #8
+    ldr x2, [x23], #8
+    adrp x0, here_ptr@page
+    add x0, x0, here_ptr@pageoff
+    ldr x1, [x0]
+    mov x3, #0
+_dq_cpy:
+    cmp x3, x5
+    b.ge _dq_al
+    ldrb w4, [x2, x3]
+    strb w4, [x1, x3]
+    add x3, x3, #1
+    b _dq_cpy
+_dq_al:
+    add x1, x1, x5
+    add x1, x1, #7
+    bic x1, x1, #7
+    adrp x0, here_ptr@page
+    add x0, x0, here_ptr@pageoff
+    str x1, [x0]
+    adrp x0, dict_type@page
+    add x0, x0, dict_type@pageoff
+    bl _compile_cell
+    ldr x19, [x23], #8
+    NEXT
+
+// _skip_blanks: advance >IN over spaces/tabs (not newlines)
+_skip_blanks:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    bl _cursor_load
+    mov x1, x0
+    bl _source_end
+    mov x9, x0
+_sb_loop:
+    cmp x1, x9
+    b.hs _sb_done
+    ldrb w2, [x1]
+    cmp w2, #32
+    b.eq _sb_adv
+    cmp w2, #9
+    b.eq _sb_adv
+    b _sb_done
+_sb_adv:
+    add x1, x1, #1
+    b _sb_loop
+_sb_done:
+    mov x0, x1
+    bl _cursor_store
+    ldp x29, x30, [sp], #16
+    ret
+
+// _parse_quote: w7=delim -> x2=c-addr, x5=u, advances >IN
+_parse_quote:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    stp x19, x20, [sp, #-16]!
+    stp x21, x22, [sp, #-16]!
+    bl _cursor_load
+    mov x21, x0                     // start (callee-saved)
+    mov x3, x0
+    bl _source_end
+    mov x6, x0
+_pq_scan:
+    cmp x3, x6
+    b.hs _pq_eos
+    ldrb w4, [x3]
+    cbz w4, _pq_eos
+    cmp w4, w7
+    b.eq _pq_found
+    add x3, x3, #1
+    b _pq_scan
+_pq_found:
+    sub x22, x3, x21                // u
+    add x3, x3, #1
+    mov x0, x3
+    bl _cursor_store
+    b _pq_out
+_pq_eos:
+    sub x22, x3, x21
+    mov x0, x3
+    bl _cursor_store
+_pq_out:
+    mov x2, x21                     // c-addr
+    mov x5, x22                     // u
+    ldp x21, x22, [sp], #16
+    ldp x19, x20, [sp], #16
+    ldp x29, x30, [sp], #16
+    ret
+
+// _compile_slit: x2=c-addr, x5=u — compile (S") + len + bytes + align
+_compile_slit:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    stp x19, x20, [sp, #-16]!
+    stp x21, x22, [sp, #-16]!
+    mov x19, x2                     // src
+    mov x20, x5                     // len
+    adrp x0, dict_slit@page
+    add x0, x0, dict_slit@pageoff
+    bl _compile_cell
+    mov x0, x20
+    bl _compile_cell
+    // copy bytes to HERE
+    adrp x1, here_ptr@page
+    add x1, x1, here_ptr@pageoff
+    ldr x21, [x1]                   // dest
+    mov x2, #0
+_cs_copy:
+    cmp x2, x20
+    b.ge _cs_pad
+    ldrb w3, [x19, x2]
+    strb w3, [x21, x2]
+    add x2, x2, #1
+    b _cs_copy
+_cs_pad:
+    add x21, x21, x20
+    // align HERE to 8
+    add x21, x21, #7
+    bic x21, x21, #7
+    adrp x1, here_ptr@page
+    add x1, x1, here_ptr@pageoff
+    str x21, [x1]
+    ldp x21, x22, [sp], #16
+    ldp x19, x20, [sp], #16
+    ldp x29, x30, [sp], #16
+    ret
 
 // ============================================================================
 // QUIT - Outer Interpreter
@@ -1610,12 +1996,17 @@ _quit_loop:
     bl   _read_line
     cbz  x0, _quit_exit
 
-    // Reset word cursor
-    adrp x0, word_cursor@page
-    add  x0, x0, word_cursor@pageoff
-    adrp x1, input_buffer@page
-    add  x1, x1, input_buffer@pageoff
-    str  x1, [x0]
+    // SOURCE = input_buffer, length = strlen, >IN = 0
+    adrp x0, input_buffer@page
+    add  x0, x0, input_buffer@pageoff
+    mov x1, #0
+1:
+    ldrb w2, [x0, x1]
+    cbz w2, 2f
+    add x1, x1, #1
+    b 1b
+2:
+    bl _set_source
 
 _interpret_loop:
     bl _next_word
@@ -1749,6 +2140,73 @@ _quit_exit:
 // C Helper Functions (assembly)
 // ============================================================================
 
+// _set_source: x0=c-addr, x1=u  — establish SOURCE / >IN=0
+_set_source:
+    adrp x2, source_addr@page
+    add x2, x2, source_addr@pageoff
+    str x0, [x2]
+    adrp x2, source_len@page
+    add x2, x2, source_len@pageoff
+    str x1, [x2]
+    adrp x2, to_in_var@page
+    add x2, x2, to_in_var@pageoff
+    str xzr, [x2]
+    adrp x2, word_cursor@page
+    add x2, x2, word_cursor@pageoff
+    str x0, [x2]
+    ret
+
+// _cursor_load: -> x0 = absolute parse pointer (SOURCE + >IN)
+_cursor_load:
+    adrp x0, source_addr@page
+    add x0, x0, source_addr@pageoff
+    ldr x0, [x0]
+    adrp x1, to_in_var@page
+    add x1, x1, to_in_var@pageoff
+    ldr x1, [x1]
+    add x0, x0, x1
+    ret
+
+// _cursor_store: x0 = absolute parse pointer; updates >IN and word_cursor
+_cursor_store:
+    adrp x1, source_addr@page
+    add x1, x1, source_addr@pageoff
+    ldr x1, [x1]
+    sub x2, x0, x1                 // offset
+    cmp x2, #0
+    b.ge 1f
+    mov x2, #0
+1:
+    adrp x3, source_len@page
+    add x3, x3, source_len@pageoff
+    ldr x3, [x3]
+    cmp x2, x3
+    b.ls 2f
+    mov x2, x3
+2:
+    adrp x1, to_in_var@page
+    add x1, x1, to_in_var@pageoff
+    str x2, [x1]
+    adrp x1, source_addr@page
+    add x1, x1, source_addr@pageoff
+    ldr x1, [x1]
+    add x1, x1, x2
+    adrp x3, word_cursor@page
+    add x3, x3, word_cursor@pageoff
+    str x1, [x3]
+    ret
+
+// _source_end: -> x0 = SOURCE+u (one past last char)
+_source_end:
+    adrp x0, source_addr@page
+    add x0, x0, source_addr@pageoff
+    ldr x0, [x0]
+    adrp x1, source_len@page
+    add x1, x1, source_len@pageoff
+    ldr x1, [x1]
+    add x0, x0, x1
+    ret
+
 // _putchar: x0 = char
 // Uses only x0-x2/x16 (+ frame). Does not touch x19-x28 (VM-safe).
 .globl _putchar
@@ -1865,9 +2323,8 @@ _next_word:
     mov x29, sp
     stp x19, x20, [sp, #-16]!
 
-    adrp x19, word_cursor@page
-    add x19, x19, word_cursor@pageoff
-    ldr x19, [x19]
+    bl _cursor_load
+    mov x19, x0
 
 _nw_skip:
     ldrb w0, [x19]
@@ -1915,10 +2372,11 @@ _nw_copy:
 _nw_copied:
     strb wzr, [x2, x3]
 
-    // Null terminate
-    adrp x4, word_cursor@page
-    add x4, x4, word_cursor@pageoff
-    str x19, [x4]
+    // update >IN (preserve len x1 and scratch x2)
+    stp x1, x2, [sp, #-16]!
+    mov x0, x19
+    bl _cursor_store
+    ldp x1, x2, [sp], #16
 
     mov x0, x2
     ldp x19, x20, [sp], #16
@@ -2285,6 +2743,9 @@ base_var:       .quad 10
 here_ptr:       .quad 0
 latest_var:     .quad 0
 word_cursor:    .quad 0
+source_addr:    .quad 0
+source_len:     .quad 0
+to_in_var:      .quad 0
 
 str_hello:  .asciz "PickleForth v0.1\n"
 str_prompt: .asciz "\nok> "
@@ -2841,7 +3302,7 @@ dict_comma:  // , ( x -- )
     .space 7
 
 .align 8
-dict_find:  // FIND ( c-addr u -- xt -1 | c-addr u 0 )  non-ANS stack; xt = entry
+dict_find:  // FIND ( c-addr -- c-addr 0 | xt 1 | xt -1 ) ANS counted string
     .quad dict_comma
     .quad 4
     .quad XFIND
@@ -3080,6 +3541,46 @@ dict_docon_addr:  // DOCON-ADDR ( -- addr )  code address of DOCON (for CONSTANT
     .quad 10
     .quad XDOCON_ADDR
     .asciz "DOCON-ADDR"
+    .space 6
+
+.align 8
+dict_source:  // SOURCE ( -- c-addr u ) ANS
+    .quad dict_docon_addr
+    .quad 6
+    .quad XSOURCE
+    .asciz "SOURCE"
+    .space 2
+
+.align 8
+dict_to_in:  // >IN ( -- a-addr ) ANS
+    .quad dict_source
+    .quad 3
+    .quad XTOIN
+    .asciz ">IN"
+    .space 5
+
+.align 8
+dict_slit:  // (S") ( -- c-addr u ) runtime helper for S" / ."
+    .quad dict_to_in
+    .quad 4
+    .quad XSLIT
+    .asciz "(S\")"
+    .space 4
+
+.align 8
+dict_squote:  // S" ( -- c-addr u ) IMMEDIATE ANS
+    .quad dict_slit
+    .quad 0x102
+    .quad XSQUOTE
+    .byte 83, 34                    // S"
+    .space 6
+
+.align 8
+dict_dotquote:  // ." ( -- ) IMMEDIATE ANS
+    .quad dict_squote
+    .quad 0x102
+    .quad XDOTQ
+    .byte 46, 34                    // ."
     .space 6
 
 // ============================================================================
