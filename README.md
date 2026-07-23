@@ -2,4 +2,4 @@ A relatively simple Terminal Console based Forth system for the MacOS Mx series 
 
 I have not yet decided whether portions of PickleForth will make their way into TZForth. One of my regrets in TZForth is that so much of it is written in Swift, so When I started PickleForth, i instructed the AI to start making all new additions Highlevel words in Forth, and to onlly use assembly when it is needed for performance. So, I believe there are about 60 words in PickleForth that are impemented in code, and the rest is COLON definitions.
 
-I don't know if anyone will find this interesting, but it is available for your browsing pleasure, and as usual, this code is plublic domain.
+I don't know if anyone will find this interesting, but it is available for your browsing pleasure, and as usual, this code is public domain.
