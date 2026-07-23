@@ -35,48 +35,45 @@
 // ----------------------------------------------------------------------------
 // Goal: grow toward ANS Core (and useful Core Ext) for words we implement.
 //
-// Already close to ANS (cell = 8 bytes / 64-bit):
-//   Stack: DUP DROP SWAP OVER ROT PICK ?DUP 2DUP 2DROP
+// ANS-oriented subset (cell = 8 bytes / 64-bit). Not a full conforming system.
+//
+// Core-like (implemented, stack/semantics intended to match ANS):
+//   Stack: DUP DROP SWAP OVER ROT PICK ?DUP 2DUP 2DROP 2SWAP 2OVER
 //   Return: >R R> R@
-//   Arith: + - * / MOD /MOD 1+ 1- NEGATE (asm present; wire if needed)
+//   Arith: + - * / MOD /MOD 1+ 1- NEGATE ABS MIN MAX LSHIFT RSHIFT
 //   Logic: AND OR XOR INVERT
-//   Compare: = < > U< 0= 0<  TRUE (-1) FALSE (0)
-//   Memory: @ ! C@ C! +!  CELL+ CELLS  (CELL as "push 8" is an extension)
-//   I/O: EMIT KEY CR TYPE  . U.  (BASE var exists; number input is decimal-only)
-//   Compile: : ; CREATE , ALLOT HERE  [ ]  IMMEDIATE LITERAL  ' EXECUTE
-//   Control (high-level): IF ELSE THEN BEGIN UNTIL AGAIN WHILE REPEAT
-//   EXIT
+//   Compare: = <> < > U< 0= 0< 0<> 0> >= <= WITHIN  TRUE FALSE
+//   Memory: @ ! C@ C! +! FILL ERASE  CELL+ CELLS CHAR+ CHARS ALIGN ALIGNED
+//   Parse:  WORD PARSE  CHAR [CHAR]  BL
+//   Comments: \  (
+//   I/O: EMIT KEY CR TYPE SPACE . U.
+//   Numeric input honors BASE; DECIMAL HEX
+//   Compile: : ; CREATE VARIABLE CONSTANT , ALLOT HERE [ ] IMMEDIATE
+//            LITERAL ' ['] EXECUTE RECURSE
+//   Control: IF ELSE THEN BEGIN UNTIL AGAIN WHILE REPEAT EXIT
 //
-// Present but non-ANS or different stack/semantics (fix later for compliance):
-//   FIND     — ANS FIND takes counted string (c-addr); we use ( c-addr u )
-//   '        — ok idea; returns entry/xt (ANS xt is opaque; ours is entry addr)
-//   >BODY    — ANS is for CREATE words only; we also use it for colon bodies
-//   >CODE >NAME >FLAGS >LINK — implementation helpers (not ANS)
-//   LIT BRANCH 0BRANCH — internal threading (not user-facing ANS)
-//   LIT-ADDR 0BRANCH-ADDR BRANCH-ADDR EXIT-ADDR — PickleForth plumbing
-//   LATEST STATE BASE as addr-pushing words — similar to ANS variables
-//   INCLUDE/FLOAD — File-Access word set territory; FLOAD is TZForth alias
-//   ALIAS SEE WORDS DOCOL? NAME>STRING ALIGNED — useful extensions
-//   .S       — common extension (Core Ext has .S in some systems; ANS has .S in tools)
+// Present but non-ANS or different (fix later):
+//   FIND     — we use ( c-addr u ); ANS FIND uses counted string only
+//   ' / xt   — xt is dictionary entry address (ANS xt is opaque)
+//   >BODY    — also used for colon bodies (ANS: CREATE words)
+//   >CODE >NAME >FLAGS >LINK NAME>STRING DOCOL? DOCON-ADDR — extensions
+//   LIT BRANCH 0BRANCH + *-ADDR plumbing — internal
+//   LATEST STATE BASE — address-pushing (BASE is ANS-like variable)
+//   INCLUDE FLOAD ALIAS SEE WORDS .S — extensions / file-ish
+//   CELL     — push 8; not an ANS word (CELL+ / CELLS are ANS)
 //
-// Missing major ANS Core pieces (examples, not exhaustive):
-//   Source:  SOURCE >IN WORD PARSE EVALUATE REFILL
-//   Comments: \  (  .(
-//   Strings:  S"  ."  C"  COUNT  /STRING  FILL  MOVE  CMOVE
-//   Defining: VARIABLE CONSTANT VALUE TO DOES> POSTPONE RECURSE
-//   Numeric:  pictured output <# # #S #> HOLD SIGN  <#...#>  #  decimal/hex
-//             number input honors BASE; >NUMBER
-//   Control:  DO LOOP +LOOP I J LEAVE UNLOOP  CASE ENDCASE OF ENDOF
-//   Double:   optional Double-Number word set
-//   Exceptions: CATCH THROW
-//   Environment: ENVIRONMENT?
-//   Comparison: <> >= <= 0<> 0>  within ABS MIN MAX (some exist in asm only)
+// Still missing major ANS Core pieces:
+//   SOURCE >IN EVALUATE REFILL
+//   S" ." C"  MOVE CMOVE
+//   VALUE TO DOES> POSTPONE
+//   Pictured numeric output <# # #S #> HOLD SIGN  >NUMBER
+//   DO LOOP +LOOP I J LEAVE UNLOOP  CASE OF ENDOF ENDCASE
+//   CATCH THROW  ENVIRONMENT?
 //
-// Implementation notes that affect ANS work:
-//   - Indirect threaded; compiled cells are dictionary *entry* addresses
-//   - Flags: true = -1, false = 0 (ANS-style)
-//   - Case-insensitive dictionary search
-//   - Prefer high-level Forth in forth_init_str; assembly only for primitives
+// Implementation notes:
+//   - Indirect threaded; compiled cells are dictionary entry addresses
+//   - Flags true=-1 false=0; case-insensitive find
+//   - Prefer high-level Forth in forth_init_str; asm only when needed
 // ============================================================================
 
 .text
@@ -164,9 +161,9 @@ _main:
     // Initialize TOS (empty stack)
     mov  x20, #0
 
-    // Initialize latest_var to dict_exit_addr (newest static word)
-    adrp x0, dict_exit_addr@page
-    add  x0, x0, dict_exit_addr@pageoff
+    // Initialize latest_var to newest static word
+    adrp x0, dict_docon_addr@page
+    add  x0, x0, dict_docon_addr@pageoff
     str  x0, [x24]
 
     // HERE = user_dict_area
@@ -551,6 +548,56 @@ _patch_dict:
     PATCH_LINK dict_exit_addr, dict_br_addr
     nop
     PATCH_CODE dict_exit_addr, XEXIT_ADDR
+    nop
+
+    // ANS Core primitives (wired from existing code + new parse/comment)
+    PATCH_LINK dict_negate, dict_exit_addr
+    nop
+    PATCH_CODE dict_negate, XNEGATE
+    nop
+    PATCH_LINK dict_abs, dict_negate
+    nop
+    PATCH_CODE dict_abs, XABS
+    nop
+    PATCH_LINK dict_min, dict_abs
+    nop
+    PATCH_CODE dict_min, XMIN
+    nop
+    PATCH_LINK dict_max, dict_min
+    nop
+    PATCH_CODE dict_max, XMAX
+    nop
+    PATCH_LINK dict_lshift, dict_max
+    nop
+    PATCH_CODE dict_lshift, XLSHIFT
+    nop
+    PATCH_LINK dict_rshift, dict_lshift
+    nop
+    PATCH_CODE dict_rshift, XRSHIFT
+    nop
+    PATCH_LINK dict_nequal, dict_rshift
+    nop
+    PATCH_CODE dict_nequal, XNEQUAL
+    nop
+    PATCH_LINK dict_parse, dict_nequal
+    nop
+    PATCH_CODE dict_parse, XPARSE
+    nop
+    PATCH_LINK dict_word, dict_parse
+    nop
+    PATCH_CODE dict_word, XWORD
+    nop
+    PATCH_LINK dict_backslash, dict_word
+    nop
+    PATCH_CODE dict_backslash, XBACKSLASH
+    nop
+    PATCH_LINK dict_paren, dict_backslash
+    nop
+    PATCH_CODE dict_paren, XPAREN
+    nop
+    PATCH_LINK dict_docon_addr, dict_paren
+    nop
+    PATCH_CODE dict_docon_addr, XDOCON_ADDR
     nop
 
     .purgem PATCH_CODE
@@ -1375,6 +1422,166 @@ XEXIT_ADDR:
     mov x20, x0
     NEXT
 
+// DOCON-ADDR ( -- addr ) address of DOCON code (for CONSTANT)
+XDOCON_ADDR:
+    DPUSH
+    adrp x0, DOCON@page
+    add x0, x0, DOCON@pageoff
+    mov x20, x0
+    NEXT
+
+// PARSE ( char "ccc<char>" -- c-addr u )
+// From word_cursor to delimiter or end; consumes delimiter if found.
+// Does not skip leading delimiters (ANS PARSE).
+XPARSE:
+    mov w7, w20                     // delimiter
+    adrp x0, word_cursor@page
+    add x0, x0, word_cursor@pageoff
+    ldr x2, [x0]                    // c-addr = start
+    mov x3, x2
+_parse_scan:
+    ldrb w4, [x3]
+    cbz w4, _parse_eos
+    cmp w4, w7
+    b.eq _parse_found
+    add x3, x3, #1
+    b _parse_scan
+_parse_found:
+    sub x5, x3, x2                  // u
+    add x3, x3, #1                  // skip delimiter
+    str x3, [x0]
+    b _parse_push
+_parse_eos:
+    sub x5, x3, x2
+    str x3, [x0]
+_parse_push:
+    // Replace char (TOS) with c-addr, then push u
+    mov x20, x2
+    str x20, [x22, #-8]!
+    mov x20, x5
+    NEXT
+
+// WORD ( char "<chars>ccc<char>" -- c-addr )
+// Skip leading delimiters, parse until delimiter, store counted string
+// in word_scratch (transient). Space delimiter also skips TAB/CR/LF.
+XWORD:
+    mov w7, w20                     // delimiter
+    adrp x0, word_cursor@page
+    add x0, x0, word_cursor@pageoff
+    ldr x2, [x0]
+_word_skip:
+    ldrb w4, [x2]
+    cbz w4, _word_empty
+    cmp w7, #32
+    b.ne _word_skip_exact
+    // space: skip space/tab/cr/lf
+    cmp w4, #32
+    b.eq _word_skip_adv
+    cmp w4, #9
+    b.eq _word_skip_adv
+    cmp w4, #10
+    b.eq _word_skip_adv
+    cmp w4, #13
+    b.eq _word_skip_adv
+    b _word_start
+_word_skip_exact:
+    cmp w4, w7
+    b.ne _word_start
+_word_skip_adv:
+    add x2, x2, #1
+    b _word_skip
+_word_start:
+    mov x3, x2                      // start of token
+_word_scan:
+    ldrb w4, [x2]
+    cbz w4, _word_end
+    cmp w7, #32
+    b.ne _word_scan_exact
+    cmp w4, #32
+    b.eq _word_end
+    cmp w4, #9
+    b.eq _word_end
+    cmp w4, #10
+    b.eq _word_end
+    cmp w4, #13
+    b.eq _word_end
+    add x2, x2, #1
+    b _word_scan
+_word_scan_exact:
+    cmp w4, w7
+    b.eq _word_end
+    add x2, x2, #1
+    b _word_scan
+_word_end:
+    sub x5, x2, x3                  // length
+    // if ended on delimiter (not NUL), consume it
+    ldrb w4, [x2]
+    cbz w4, _word_store
+    add x2, x2, #1
+_word_store:
+    str x2, [x0]                    // update cursor
+    // counted string at word_scratch: max 63 chars
+    cmp x5, #63
+    b.ls _word_len_ok
+    mov x5, #63
+_word_len_ok:
+    adrp x6, word_scratch@page
+    add x6, x6, word_scratch@pageoff
+    strb w5, [x6]                   // count byte
+    mov x1, #0
+_word_copy:
+    cmp x1, x5
+    b.ge _word_done
+    ldrb w4, [x3, x1]
+    add x8, x6, #1
+    strb w4, [x8, x1]
+    add x1, x1, #1
+    b _word_copy
+_word_done:
+    mov x20, x6                     // c-addr of counted string
+    NEXT
+_word_empty:
+    str x2, [x0]
+    adrp x6, word_scratch@page
+    add x6, x6, word_scratch@pageoff
+    strb wzr, [x6]
+    mov x20, x6
+    NEXT
+
+// \ ( -- ) IMMEDIATE  discard rest of parse area (to end of line)
+XBACKSLASH:
+    adrp x0, word_cursor@page
+    add x0, x0, word_cursor@pageoff
+    ldr x1, [x0]
+_bs_loop:
+    ldrb w2, [x1]
+    cbz w2, _bs_done
+    cmp w2, #10
+    b.eq _bs_done
+    add x1, x1, #1
+    b _bs_loop
+_bs_done:
+    str x1, [x0]
+    NEXT
+
+// ( ( -- ) IMMEDIATE  paren comment; discard until ')'
+XPAREN:
+    adrp x0, word_cursor@page
+    add x0, x0, word_cursor@pageoff
+    ldr x1, [x0]
+_par_loop:
+    ldrb w2, [x1]
+    cbz w2, _par_done
+    cmp w2, #41                     // ')'
+    b.eq _par_found
+    add x1, x1, #1
+    b _par_loop
+_par_found:
+    add x1, x1, #1                  // skip ')'
+_par_done:
+    str x1, [x0]
+    NEXT
+
 // ============================================================================
 // QUIT - Outer Interpreter
 // ============================================================================
@@ -1726,17 +1933,31 @@ _nw_eof:
     ret
 
 // _parse_number: x0=addr, x1=len -> x0=1 (val in x1) or 0
+// Honors BASE (2..36). Digits: 0-9, A-Z / a-z.
 _parse_number:
     stp x29, x30, [sp, #-16]!
     mov x29, sp
     stp x19, x20, [sp, #-16]!
-    mov x19, x0
-    mov x20, x1
-    mov x2, #0
-    mov x3, #0
-    mov x4, #0
+    stp x21, x22, [sp, #-16]!
+    mov x19, x0                 // addr
+    mov x20, x1                 // len
+    mov x2, #0                  // accumulator
+    mov x3, #0                  // digit count
+    mov x4, #0                  // negative flag
+    // base
+    adrp x21, base_var@page
+    add x21, x21, base_var@pageoff
+    ldr x21, [x21]
+    cmp x21, #2
+    b.lo _pn_base10
+    cmp x21, #36
+    b.ls _pn_base_ok
+_pn_base10:
+    mov x21, #10
+_pn_base_ok:
+    cbz x20, _pn_fail
     ldrb w5, [x19]
-    cmp w5, #45
+    cmp w5, #45                 // '-'
     b.ne _pn_loop
     mov x4, #1
     add x19, x19, #1
@@ -1744,12 +1965,27 @@ _parse_number:
 _pn_loop:
     cbz x20, _pn_done
     ldrb w5, [x19], #1
-    sub w5, w5, #48
-    cmp w5, #9
+    // digit value in w22
+    sub w22, w5, #48            // '0'
+    cmp w22, #9
+    b.ls _pn_have_digit
+    // A-Z / a-z -> 10..35
+    mov w22, w5
+    cmp w22, #97                // 'a'
+    b.lo _pn_upper
+    cmp w22, #122               // 'z'
     b.hi _pn_fail
-    mov x6, #10
-    mul x2, x2, x6
-    add x2, x2, x5
+    sub w22, w22, #32           // tolower -> toupper
+_pn_upper:
+    sub w22, w22, #65           // 'A'
+    cmp w22, #25
+    b.hi _pn_fail
+    add w22, w22, #10
+_pn_have_digit:
+    cmp x22, x21                // digit must be < base
+    b.hs _pn_fail
+    mul x2, x2, x21
+    add x2, x2, x22
     add x3, x3, #1
     sub x20, x20, #1
     b _pn_loop
@@ -1760,11 +1996,13 @@ _pn_done:
 _pn_pos:
     mov x0, #1
     mov x1, x2
+    ldp x21, x22, [sp], #16
     ldp x19, x20, [sp], #16
     ldp x29, x30, [sp], #16
     ret
 _pn_fail:
     mov x0, #0
+    ldp x21, x22, [sp], #16
     ldp x19, x20, [sp], #16
     ldp x29, x30, [sp], #16
     ret
@@ -2049,20 +2287,40 @@ str_x:      .asciz "X"
 //   REPEAT ( orig dest -- )         BRANCH to dest, resolve WHILE
 // ============================================================================
 forth_init_str:
-    // --- ANS-ish core helpers ---
-    .ascii ": SPACE 32 EMIT ; "              // ( -- ) emit a space
-    .ascii ": CELL+ 8 + ; "                  // ( a-addr1 -- a-addr2 ) ANS
-    .ascii ": CELLS 8 * ; "                  // ( n1 -- n2 ) ANS
-    .ascii ": 2DUP OVER OVER ; "             // ( a b -- a b a b )
-    .ascii ": 2DROP DROP DROP ; "            // ( a b -- )
+    // Order matters: define dependencies before users.
 
-    // --- Dictionary structure (PickleForth; not ANS names except >BODY idea) ---
-    .ascii ": >LINK ; "                      // ( xt -- a-addr )
-    .ascii ": >FLAGS 8 + ; "                 // ( xt -- a-addr )
-    .ascii ": >CODE 16 + ; "                 // ( xt -- a-addr )
-    .ascii ": >NAME 24 + ; "                 // ( xt -- a-addr )
+    // --- 1. Simple ANS helpers (no control flow, no >CODE) ---
+    .ascii ": BL 32 ; "
+    .ascii ": SPACE BL EMIT ; "
+    .ascii ": CHAR+ 1+ ; "
+    .ascii ": CHARS ; "
+    .ascii ": CELL+ 8 + ; "
+    .ascii ": CELLS 8 * ; "
+    .ascii ": ALIGNED 7 + 7 INVERT AND ; "
+    .ascii ": ALIGN HERE ALIGNED HERE - ALLOT ; "
+    .ascii ": 2DUP OVER OVER ; "
+    .ascii ": 2DROP DROP DROP ; "
+    .ascii ": 2SWAP ROT >R ROT R> ; "
+    .ascii ": 2OVER >R >R 2DUP R> R> 2SWAP ; "
+    .ascii ": COUNT DUP C@ SWAP CHAR+ SWAP ; "
+    .ascii ": /STRING DUP >R - SWAP R> + SWAP ; "
+    .ascii ": DECIMAL 10 BASE ! ; "
+    .ascii ": HEX 16 BASE ! ; "
+    .ascii ": 0<> 0= 0= ; "
+    .ascii ": 0> 0 > ; "
+    .ascii ": >= < 0= ; "
+    .ascii ": <= > 0= ; "
+    .ascii ": WITHIN OVER - >R - R> U< ; "
 
-    // --- Control flow (immediate) ---
+    // --- 2. Dictionary field accessors (needed by CONSTANT, ALIAS, SEE) ---
+    .ascii ": >LINK ; "
+    .ascii ": >FLAGS 8 + ; "
+    .ascii ": >CODE 16 + ; "
+    .ascii ": >NAME 24 + ; "
+    .ascii ": NAME>STRING DUP >NAME SWAP >FLAGS @ 255 AND ; "
+    .ascii ": >BODY NAME>STRING ALIGNED + ; "
+
+    // --- 3. Control flow (immediate) ---
     .ascii ": BEGIN HERE ; IMMEDIATE "
     .ascii ": UNTIL 0BRANCH-ADDR , HERE - , ; IMMEDIATE "
     .ascii ": AGAIN BRANCH-ADDR , HERE - , ; IMMEDIATE "
@@ -2072,19 +2330,22 @@ forth_init_str:
     .ascii ": WHILE 0BRANCH-ADDR , HERE 0 , ; IMMEDIATE "
     .ascii ": REPEAT BRANCH-ADDR , SWAP HERE - , HERE OVER - SWAP ! ; IMMEDIATE "
 
-    // --- Introspection / tools ---
-    .ascii ": NAME>STRING DUP >NAME SWAP >FLAGS @ 255 AND ; "  // ( xt -- c-addr u )
-    .ascii ": WORDS LATEST @ BEGIN DUP WHILE DUP NAME>STRING TYPE SPACE @ REPEAT DROP CR ; "
-    .ascii ": ALIGNED 7 + 7 INVERT AND ; "   // ( n1 -- n2 ) round up to 8
-    .ascii ": >BODY NAME>STRING ALIGNED + ; " // ( xt -- a-addr )
-    .ascii ": DOCOL? >CODE @ ['] WORDS >CODE @ = ; "  // ( xt -- flag )
-    // SEE ( "<name>" -- )  show ": name ..." or "CODE name (primitive)"
-    .ascii ": SEE ' DUP DOCOL? IF 58 EMIT SPACE ELSE 67 EMIT 79 EMIT 68 EMIT 69 EMIT SPACE THEN DUP NAME>STRING TYPE SPACE DUP DOCOL? 0= IF DROP 40 EMIT 112 EMIT 114 EMIT 105 EMIT 109 EMIT 105 EMIT 116 EMIT 105 EMIT 118 EMIT 101 EMIT 41 EMIT CR EXIT THEN >BODY BEGIN DUP @ DUP EXIT-ADDR = IF 2DROP 59 EMIT CR EXIT THEN DUP LIT-ADDR = IF DROP 8 + DUP @ . 8 + ELSE DUP NAME>STRING TYPE SPACE DUP BRANCH-ADDR = OVER 0BRANCH-ADDR = OR IF DROP 8 + DUP @ . SPACE 8 + ELSE DROP 8 + THEN THEN AGAIN ; "
+    // --- 4. Defining words / parse helpers using the above ---
+    .ascii ": CHAR BL WORD COUNT DROP C@ ; "
+    .ascii ": [CHAR] CHAR LIT-ADDR , , ; IMMEDIATE "
+    .ascii ": VARIABLE CREATE 0 , ; "
+    .ascii ": CONSTANT CREATE , DOCON-ADDR LATEST @ >CODE ! ; "
+    .ascii ": RECURSE LATEST @ , ; IMMEDIATE "
+    // FILL ( c-addr u char -- ); stack top is u, so bump addr via SWAP 1+ SWAP
+    .ascii ": FILL >R BEGIN DUP WHILE OVER R@ SWAP C! SWAP 1+ SWAP 1- REPEAT R> DROP 2DROP ; "
+    .ascii ": ERASE 0 FILL ; "
 
-    // --- Aliases ---
-    // ALIAS ( xt "<name>" -- )  ' INCLUDE ALIAS FLOAD
+    // --- 5. Tools / extensions ---
+    .ascii ": WORDS LATEST @ BEGIN DUP WHILE DUP NAME>STRING TYPE SPACE @ REPEAT DROP CR ; "
+    .ascii ": DOCOL? >CODE @ ['] WORDS >CODE @ = ; "
+    .ascii ": SEE ' DUP DOCOL? IF 58 EMIT SPACE ELSE 67 EMIT 79 EMIT 68 EMIT 69 EMIT SPACE THEN DUP NAME>STRING TYPE SPACE DUP DOCOL? 0= IF DROP 40 EMIT 112 EMIT 114 EMIT 105 EMIT 109 EMIT 105 EMIT 116 EMIT 105 EMIT 118 EMIT 101 EMIT 41 EMIT CR EXIT THEN >BODY BEGIN DUP @ DUP EXIT-ADDR = IF 2DROP 59 EMIT CR EXIT THEN DUP LIT-ADDR = IF DROP 8 + DUP @ . 8 + ELSE DUP NAME>STRING TYPE SPACE DUP BRANCH-ADDR = OVER 0BRANCH-ADDR = OR IF DROP 8 + DUP @ . SPACE 8 + ELSE DROP 8 + THEN THEN AGAIN ; "
     .ascii ": ALIAS CREATE LATEST @ >CODE SWAP >CODE @ SWAP ! ; "
-    .ascii "' INCLUDE ALIAS FLOAD "          // FLOAD ( "file" -- ) same as INCLUDE
+    .ascii "' INCLUDE ALIAS FLOAD "
 
     .byte 0  // null terminator
 
@@ -2696,6 +2957,102 @@ dict_exit_addr:  // EXIT-ADDR ( -- addr )
     .quad XEXIT_ADDR
     .asciz "EXIT-ADDR"
     .space 7
+
+.align 8
+dict_negate:  // NEGATE ( n1 -- n2 ) ANS
+    .quad dict_exit_addr
+    .quad 6
+    .quad XNEGATE
+    .asciz "NEGATE"
+    .space 2
+
+.align 8
+dict_abs:  // ABS ( n -- u ) ANS
+    .quad dict_negate
+    .quad 3
+    .quad XABS
+    .asciz "ABS"
+    .space 5
+
+.align 8
+dict_min:  // MIN ( n1 n2 -- n3 ) ANS
+    .quad dict_abs
+    .quad 3
+    .quad XMIN
+    .asciz "MIN"
+    .space 5
+
+.align 8
+dict_max:  // MAX ( n1 n2 -- n3 ) ANS
+    .quad dict_min
+    .quad 3
+    .quad XMAX
+    .asciz "MAX"
+    .space 5
+
+.align 8
+dict_lshift:  // LSHIFT ( x1 u -- x2 ) ANS
+    .quad dict_max
+    .quad 6
+    .quad XLSHIFT
+    .asciz "LSHIFT"
+    .space 2
+
+.align 8
+dict_rshift:  // RSHIFT ( x1 u -- x2 ) ANS
+    .quad dict_lshift
+    .quad 6
+    .quad XRSHIFT
+    .asciz "RSHIFT"
+    .space 2
+
+.align 8
+dict_nequal:  // <> ( x1 x2 -- flag ) ANS
+    .quad dict_rshift
+    .quad 2
+    .quad XNEQUAL
+    .asciz "<>"
+    .space 6
+
+.align 8
+dict_parse:  // PARSE ( char "ccc<char>" -- c-addr u ) ANS
+    .quad dict_nequal
+    .quad 5
+    .quad XPARSE
+    .asciz "PARSE"
+    .space 3
+
+.align 8
+dict_word:  // WORD ( char "<chars>ccc<char>" -- c-addr ) ANS
+    .quad dict_parse
+    .quad 4
+    .quad XWORD
+    .asciz "WORD"
+    .space 4
+
+.align 8
+dict_backslash:  // \ ( -- ) IMMEDIATE  ANS line comment
+    .quad dict_word
+    .quad 0x101
+    .quad XBACKSLASH
+    .byte 92
+    .space 7
+
+.align 8
+dict_paren:  // ( ( -- ) IMMEDIATE  ANS paren comment
+    .quad dict_backslash
+    .quad 0x101
+    .quad XPAREN
+    .byte 40
+    .space 7
+
+.align 8
+dict_docon_addr:  // DOCON-ADDR ( -- addr )  code address of DOCON (for CONSTANT)
+    .quad dict_paren
+    .quad 10
+    .quad XDOCON_ADDR
+    .asciz "DOCON-ADDR"
+    .space 6
 
 // ============================================================================
 // User dictionary space (grows upward)
