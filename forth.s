@@ -2070,107 +2070,135 @@ _compile_cell:
     str x1, [x2]
     ret
 
-// _print_signed: x0=value
+// _print_signed: x0=value  (uses BASE; leading '-' if negative)
 _print_signed:
     stp x29, x30, [sp, #-16]!
     mov x29, sp
-    sub sp, sp, #32
+    sub sp, sp, #80             // 16-byte aligned; room for digits + sign + NUL
     mov x1, sp
     bl _i64_to_str
     mov x0, sp
     bl _print_string_svc
-    add sp, sp, #32
+    add sp, sp, #80
     ldp x29, x30, [sp], #16
     ret
 
-// _print_unsigned: x0=value
+// _print_unsigned: x0=value  (uses BASE; always unsigned)
 _print_unsigned:
     stp x29, x30, [sp, #-16]!
     mov x29, sp
-    sub sp, sp, #32
+    sub sp, sp, #80
     mov x1, sp
     bl _u64_to_str
     mov x0, sp
     bl _print_string_svc
-    add sp, sp, #32
+    add sp, sp, #80
     ldp x29, x30, [sp], #16
     ret
 
-// _i64_to_str: x0=val, x1=buf (32-byte buffer)
-// Writes decimal ASCII at buf. Does NOT modify SP (Apple Silicon SP alignment).
+// _load_base: -> x6 = BASE clamped to 2..36
+_load_base:
+    adrp x6, base_var@page
+    add x6, x6, base_var@pageoff
+    ldr x6, [x6]
+    cmp x6, #2
+    b.lo _lb_def
+    cmp x6, #36
+    b.ls _lb_ok
+_lb_def:
+    mov x6, #10
+_lb_ok:
+    ret
+
+// _digit_char: w8 = digit value 0..35 -> ASCII in w8
+_digit_char:
+    cmp w8, #9
+    b.hi _dc_alpha
+    add w8, w8, #48             // '0'
+    ret
+_dc_alpha:
+    add w8, w8, #55             // 'A' - 10
+    ret
+
+// _i64_to_str: x0=val, x1=buf — signed, current BASE
 _i64_to_str:
     stp x29, x30, [sp, #-16]!
     mov x29, sp
-    mov x2, x1
-    add x3, x1, #32       // x3 = temp write pointer (end of buffer)
-    mov x4, x0
-    mov x5, #0            // x5 = digit count
+    stp x19, x20, [sp, #-16]!
+    mov x2, x1                  // write ptr
+    add x3, x1, #64             // temp digit area near end of 72-byte buf
+    mov x4, x0                  // value
+    mov x5, #0                  // digit count
+    bl _load_base               // x6 = base
+    mov x19, x6
     cmp x4, #0
     b.ge _i2s_pos
     mov w6, #45
-    strb w6, [x2], #1     // write '-'
+    strb w6, [x2], #1           // '-'
     neg x4, x4
 _i2s_pos:
     cbnz x4, _i2s_div
-    // value is 0: write '0' and done
     mov w6, #48
     strb w6, [x2], #1
     strb wzr, [x2]
+    ldp x19, x20, [sp], #16
     ldp x29, x30, [sp], #16
     ret
 _i2s_div:
-    mov x6, #10
-    udiv x7, x4, x6
-    msub x8, x7, x6, x4
-    add w8, w8, #48
-    strb w8, [x3, #-1]!   // write digit to temp area (pre-decrement, within buffer)
+    udiv x7, x4, x19
+    msub x8, x7, x19, x4        // remainder
+    bl _digit_char
+    strb w8, [x3, #-1]!
     add x5, x5, #1
     mov x4, x7
     cbnz x4, _i2s_div
 _i2s_cpy:
     cbz x5, _i2s_done
-    ldrb w8, [x3], #1     // read from temp area (going forward)
-    strb w8, [x2], #1     // write to buf (going forward)
+    ldrb w8, [x3], #1
+    strb w8, [x2], #1
     sub x5, x5, #1
     b _i2s_cpy
 _i2s_done:
     strb wzr, [x2]
+    ldp x19, x20, [sp], #16
     ldp x29, x30, [sp], #16
     ret
 
-// _u64_to_str: x0=val, x1=buf (32-byte buffer)
-// Writes unsigned decimal ASCII at buf. Does NOT modify SP.
+// _u64_to_str: x0=val, x1=buf — unsigned, current BASE
 _u64_to_str:
     stp x29, x30, [sp, #-16]!
     mov x29, sp
+    stp x19, x20, [sp, #-16]!
     mov x2, x1
-    add x3, x1, #32       // x3 = temp write pointer (end of buffer)
+    add x3, x1, #64
     mov x4, x0
-    mov x5, #0            // x5 = digit count
+    mov x5, #0
+    bl _load_base
+    mov x19, x6
     cbnz x4, _u2s_div
-    // value is 0: write '0' and done
     mov w6, #48
     strb w6, [x2], #1
     strb wzr, [x2]
+    ldp x19, x20, [sp], #16
     ldp x29, x30, [sp], #16
     ret
 _u2s_div:
-    mov x6, #10
-    udiv x7, x4, x6
-    msub x8, x7, x6, x4
-    add w8, w8, #48
-    strb w8, [x3, #-1]!   // write digit to temp area (pre-decrement, within buffer)
+    udiv x7, x4, x19
+    msub x8, x7, x19, x4
+    bl _digit_char
+    strb w8, [x3, #-1]!
     add x5, x5, #1
     mov x4, x7
     cbnz x4, _u2s_div
 _u2s_cpy:
     cbz x5, _u2s_done
-    ldrb w8, [x3], #1     // read from temp area (going forward)
-    strb w8, [x2], #1     // write to buf (going forward)
+    ldrb w8, [x3], #1
+    strb w8, [x2], #1
     sub x5, x5, #1
     b _u2s_cpy
 _u2s_done:
     strb wzr, [x2]
+    ldp x19, x20, [sp], #16
     ldp x29, x30, [sp], #16
     ret
 
