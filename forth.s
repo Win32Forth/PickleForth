@@ -31,60 +31,96 @@
 // NEXT: load dict_entry from *IP, load code_field from entry, jump.
 //
 // ----------------------------------------------------------------------------
-// ANS Forth (2012) status — PickleForth is NOT a conforming ANS system yet.
+// ANS Forth 2012 compatibility
 // ----------------------------------------------------------------------------
-// Goal: grow toward ANS Core (and useful Core Ext) for words we implement.
+// Cell size: 64-bit (8 bytes). Flags: true = -1, false = 0.
 //
-// ANS-oriented subset (cell = 8 bytes / 64-bit). Not a full conforming system.
+// CORE (6.1) — word names: complete (all required Core names are present).
+// This is NOT a claim of formal ANS System compliance: semantics, environmental
+// restrictions, and the Hayes / forth2012-test-suite have not been certified.
+// ENVIRONMENT? answers CORE true, CORE-EXT false, FLOORED false.
 //
-// Core-like (implemented, stack/semantics intended to match ANS):
-//   Stack: DUP DROP SWAP OVER ROT PICK ?DUP 2DUP 2DROP 2SWAP 2OVER
-//   Return: >R R> R@
-//   Arith: + - * / MOD /MOD 1+ 1- NEGATE ABS MIN MAX LSHIFT RSHIFT
-//   Logic: AND OR XOR INVERT
-//   Compare: = <> < > U< 0= 0< 0<> 0> >= <= WITHIN  TRUE FALSE
-//   Memory: @ ! C@ C! +! FILL ERASE  CELL+ CELLS CHAR+ CHARS ALIGN ALIGNED
-//           2@ 2! C,
-//   Parse:  WORD PARSE  CHAR [CHAR]  BL
+// Core coverage (by area; stack comments intended to match ANS):
+//   Stack:    DUP DROP SWAP OVER ROT PICK ?DUP 2DUP 2DROP 2SWAP 2OVER DEPTH
+//   Return:   >R R> R@
+//   Arith:    + - * / MOD /MOD 1+ 1- NEGATE ABS MIN MAX LSHIFT RSHIFT
+//             */ */MOD  (symmetric intermediate divide via SM/REM)
+//   Double:   S>D 2* 2/ 2@ 2! UM* M* UM/MOD SM/REM FM/MOD
+//   Logic:    AND OR XOR INVERT
+//   Compare:  = <> < > U< 0= 0< 0<> 0> >= <= WITHIN TRUE FALSE
+//   Memory:   @ ! C@ C! C, +! FILL ERASE MOVE CELL+ CELLS CHAR+ CHARS
+//             ALIGN ALIGNED
+//   Parse:    WORD PARSE CHAR [CHAR] BL >NUMBER
 //   Comments: \  (
-//   I/O: EMIT KEY CR TYPE SPACE SPACES . U.
-//   Stack probe: SP0 SP@ ; DEPTH is high-level (SEE-able)
-//   Double: S>D 2* 2/ 2@ 2! UM* M* UM/MOD SM/REM FM/MOD */MOD */
-//   Numeric input honors BASE; DECIMAL HEX
-//   Compile: : ; CREATE VARIABLE CONSTANT , ALLOT HERE [ ] IMMEDIATE
-//            LITERAL ' ['] EXECUTE RECURSE
-//   Control: IF ELSE THEN BEGIN UNTIL AGAIN WHILE REPEAT EXIT
-//   Outer: QUIT (CODE) ABORT ABORT" (high-level)
+//   I/O:      EMIT KEY CR TYPE SPACE SPACES . U. ACCEPT
+//   Strings:  S" ." COUNT
+//   Numeric:  BASE DECIMAL HEX  pictured <# # #S #> HOLD SIGN
+//   Compile:  : ; CREATE VARIABLE CONSTANT , ALLOT DP HERE
+//             LITERAL ' ['] EXECUTE RECURSE IMMEDIATE [ ] POSTPONE
+//   Control:  IF ELSE THEN BEGIN UNTIL AGAIN WHILE REPEAT EXIT
+//             DO LOOP +LOOP I J LEAVE UNLOOP DOES>
+//   Source:   SOURCE >IN EVALUATE REFILL SOURCE-ID
+//   Search:   FIND ENVIRONMENT?
+//   Outer:    QUIT ABORT ABORT"
+//   Except:   CATCH THROW  (Exception word set; used by ABORT path)
 //
-// Present but non-ANS or different (fix later):
-//   FIND     — ANS shape (counted string; 1=imm / -1=non-imm / 0=missing)
-//   ' / xt   — xt is dictionary entry address (ANS xt is opaque)
-//   >BODY    — also used for colon bodies (ANS: CREATE words)
-//   >CODE >NAME >FLAGS >LINK NAME>STRING DOCOL? DOCON-ADDR — extensions
-//   LIT BRANCH 0BRANCH + *-ADDR plumbing — internal
-//   LATEST STATE BASE — address-pushing (BASE is ANS-like variable)
-//   INCLUDE FLOAD ALIAS SEE WORDS .S ELAPSED .ELAPSED MS@ UNUSED .FREE
-//   DUMP FORGET ANEW USER-DICT REDEF-WARNING — extensions / file-ish
-//   CELL     — push 8; not an ANS word (CELL+ / CELLS are ANS)
+// Implementation choices / differences (still ANS-legal where noted):
+//   xt from ' / FIND / [']  = dictionary *entry* address (not CFA).
+//     ANS xt is opaque; EXECUTE expects that entry. >CODE gives the CFA.
+//   / MOD /MOD              = symmetric (toward zero), ARM sdiv; FLOORED false.
+//   >BODY                   = after name for any xt (used by SEE on colon words);
+//                             ANS text is oriented toward CREATE bodies.
+//   FIND                    = case-insensitive names.
+//   INCLUDE                 = loads whole file into one SOURCE (REFILL is false
+//                             for file/EVALUATE sources; true only for terminal).
+//   Header layout           = link | flags|len | code | name | body  (see above).
 //
-// Still missing major ANS Core pieces:
-//   C" VALUE TO  (and more Core Ext)
-// Batch-6: ACCEPT >NUMBER ENVIRONMENT? REFILL SOURCE-ID
+// ----------------------------------------------------------------------------
+// CORE EXT (6.2) — partial (~half of the word set by name)
+// ----------------------------------------------------------------------------
+// ANS Core Extensions word set — implemented in PickleForth:
+//   <>  0<>  0>  AGAIN
+//   CASE  OF  ENDOF  ENDCASE
+//   ERASE  FALSE  TRUE  HEX
+//   NIP  TUCK  PICK  PAD  PARSE
+//   REFILL  SOURCE-ID  UNUSED  WITHIN
+//   \          (line comment; also used as Core Ext)
 //
-// Batch-1: S" ."  ANS FIND  SOURCE  >IN
-// Batch-2: DO LOOP +LOOP I J LEAVE UNLOOP  DOES>  pictured numeric
-// Batch-3: POSTPONE  MOVE CMOVE CMOVE>  CASE OF ENDOF ENDCASE
-//          EVALUATE (nested SOURCE)  CATCH THROW
-// Batch-4: SPACES C, S>D 2* 2/ 2@ 2!  (CODE); DEPTH is high-level via SP0/SP@
-// Batch-5 double-cell: UM* M* UM/MOD SM/REM FM/MOD (CODE); */MOD */ high-level
-//   Note: DO/LOOP are compilation words (use inside : defs). CREATE body is
-//   does_ip at +0, user PFA at +8 (DOVAR/DODOES/DOCON aware).
-//   EVALUATE nests SOURCE via a stack (also used by INCLUDE/FLOAD).
+// Related non-Core-Ext but present (File / tools / common):
+//   CMOVE  CMOVE>  INCLUDE  (FLOAD is an alias of INCLUDE)
+//
+// ANS Core Extensions — NOT implemented yet:
+//   .(  :NONAME  ?DO
+//   2>R  2R>  2R@
+//   BUFFER:  C"  COMPILE,  [COMPILE]
+//   DEFER  DEFER!  DEFER@  IS  ACTION-OF
+//   HOLDS  MARKER
+//   PARSE-NAME
+//   ROLL  U>  U.R
+//   S\"   (escaped string; we have S" only)
+//   SAVE-INPUT  RESTORE-INPUT
+//   VALUE  TO
+//
+// ENVIRONMENT? currently returns CORE-EXT false (incomplete word set).
+//
+// ----------------------------------------------------------------------------
+// PickleForth extensions (not ANS Core / Core Ext)
+// ----------------------------------------------------------------------------
+//   >CODE >NAME >FLAGS >LINK NAME>STRING DOCOL? DOCON-ADDR CELL
+//   SP0 SP@ SP!           stack probes (DEPTH and ABORT use these)
+//   LATEST                DP is ANS-style; LATEST is system
+//   LIT BRANCH 0BRANCH and *-ADDR plumbing
+//   ALIAS SEE WORDS .S DUMP FORGET ANEW USER-DICT REDEF-WARNING
+//   .FREE MS@ ELAPSED .ELAPSED CONTAINS
+//   Line editor + history; "undefined:" and stack error reporting
+//   SIGSEGV/SIGBUS recovery back to QUIT
 //
 // Implementation notes:
-//   - Indirect threaded; compiled cells are dictionary entry addresses
-//   - Flags true=-1 false=0; case-insensitive find
-//   - Prefer high-level Forth in forth_init_str; asm only when needed
+//   - Indirect threaded; colon cells hold dictionary entry addresses (xts)
+//   - Prefer high-level Forth in forth_init_str; assembly when needed
+//   - CREATE body: does_ip at +0, user PFA at +8 (DOVAR / DODOES / DOCON)
+//   - No stack checks inside primitives (speed); outer interpreter checks
+//     DSP between words; memory faults recover via signal handler
 // ============================================================================
 
 .text
