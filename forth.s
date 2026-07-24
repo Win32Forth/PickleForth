@@ -111,6 +111,7 @@
 //   LATEST                DP is ANS-style; LATEST is system
 //   LIT BRANCH 0BRANCH and *-ADDR plumbing
 //   ALIAS SEE WORDS .S DUMP FORGET ANEW USER-DICT REDEF-WARNING
+//   FILE-ECHO ON OFF      echo INCLUDE/FLOAD source lines when FILE-ECHO is on
 //   .FREE MS@ ELAPSED .ELAPSED CONTAINS
 //   Line editor + history; "undefined:" and stack error reporting
 //   SIGSEGV/SIGBUS recovery back to QUIT
@@ -209,8 +210,8 @@ _main:
     mov  x20, #0
 
     // Initialize latest_var to newest static word
-    adrp x0, dict_environment_q@page
-    add  x0, x0, dict_environment_q@pageoff
+    adrp x0, dict_file_echo@page
+    add  x0, x0, dict_file_echo@pageoff
     str  x0, [x24]
 
     // HERE = user_dict_area
@@ -889,6 +890,11 @@ _patch_dict:
     PATCH_LINK dict_environment_q, dict_to_number
     nop
     PATCH_CODE dict_environment_q, XENVIRONMENT_Q
+    nop
+    // FILE-ECHO ( -- addr )
+    PATCH_LINK dict_file_echo, dict_environment_q
+    nop
+    PATCH_CODE dict_file_echo, XFILE_ECHO
     nop
 
     .purgem PATCH_CODE
@@ -1642,12 +1648,18 @@ _include_fail_restore:
     ldp x25, x26, [sp], #16
     RESTORE_VM
 _include_fail:
+    // "can't open: <path>\n"  (word_scratch still holds the filename)
     mov x0, #1
-    adrp x1, str_quest@page
-    add x1, x1, str_quest@pageoff
-    mov x2, #2
+    adrp x1, str_cant_open@page
+    add x1, x1, str_cant_open@pageoff
+    mov x2, #12                    // "can't open: "
     mov x16, #4
     svc #0x80
+    adrp x0, word_scratch@page
+    add x0, x0, word_scratch@pageoff
+    bl _print_string_svc
+    mov x0, #10
+    bl _putchar
     b _do_quit
 
 // ============================================================================
@@ -1917,6 +1929,15 @@ XREDEF_WARNING:
     str x20, [x22, #-8]!
     adrp x0, redef_warn@page
     add x0, x0, redef_warn@pageoff
+    mov x20, x0
+    NEXT
+
+// FILE-ECHO ( -- addr )  VARIABLE-like; non-zero = echo INCLUDE/FLOAD lines
+// Defaults to 0 (OFF). Use: FILE-ECHO ON   or   FILE-ECHO OFF
+XFILE_ECHO:
+    str x20, [x22, #-8]!
+    adrp x0, file_echo@page
+    add x0, x0, file_echo@pageoff
     mov x20, x0
     NEXT
 
@@ -3175,6 +3196,10 @@ _interpret_loop:
     // Between words: catch underflow/overflow from the previous word
     bl _check_stack
 
+    // When FILE-ECHO is on and SOURCE is an INCLUDE buffer, echo source
+    // lines up through the current parse position before the next word.
+    bl _file_echo_upto_cursor
+
     bl _next_word
     cbz x1, _interpret_empty
 
@@ -3381,10 +3406,132 @@ _set_source:
     adrp x2, word_cursor@page
     add x2, x2, word_cursor@pageoff
     str x0, [x2]
+    // Reset FILE-ECHO scan so the new SOURCE echoes from its start
+    adrp x2, file_echo_pos@page
+    add x2, x2, file_echo_pos@pageoff
+    str x0, [x2]
     ret
 
-// _push_source: save current SOURCE/>IN/SOURCE-ID on source_stack.
-// Frame = 4 quads (addr, len, >IN, source-id). Clobbers x0-x3.
+// _file_echo_upto_cursor: if FILE-ECHO nonzero and SOURCE-ID > 0 (INCLUDE),
+// write any not-yet-echoed source text through the end of the line that
+// contains the next non-whitespace character (lookahead from word_cursor).
+// That way blank lines skipped by the parser are still echoed.
+// Tracks progress in file_echo_pos (absolute address).
+// Safe to call with any VM regs live; uses only x0-x4/x16 (+ frame).
+_file_echo_upto_cursor:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    // FILE-ECHO off?
+    adrp x0, file_echo@page
+    add x0, x0, file_echo@pageoff
+    ldr x0, [x0]
+    cbz x0, _fe_done
+    // Only for INCLUDE / file-ish buffers (SOURCE-ID > 0)
+    adrp x0, source_id_var@page
+    add x0, x0, source_id_var@pageoff
+    ldr x0, [x0]
+    cmp x0, #0
+    b.le _fe_done
+    // source base / end
+    adrp x1, source_addr@page
+    add x1, x1, source_addr@pageoff
+    ldr x1, [x1]                   // x1 = source base
+    adrp x2, source_len@page
+    add x2, x2, source_len@pageoff
+    ldr x2, [x2]
+    add x2, x1, x2                 // x2 = source end
+    // cursor = word_cursor, clamped
+    adrp x0, word_cursor@page
+    add x0, x0, word_cursor@pageoff
+    ldr x0, [x0]
+    cmp x0, x1
+    csel x0, x1, x0, lo
+    cmp x0, x2
+    csel x0, x2, x0, hi
+    // Lookahead: skip whitespace to next token (or end)
+1:
+    cmp x0, x2
+    b.hs 2f
+    ldrb w3, [x0]
+    cbz w3, 2f
+    cmp w3, #32
+    b.eq 3f
+    cmp w3, #10
+    b.eq 3f
+    cmp w3, #9
+    b.eq 3f
+    b 2f                           // non-ws: target found
+3:
+    add x0, x0, #1
+    b 1b
+2:
+    // x0 = target (next token or end). Find end of that line.
+    mov x3, x0                     // x3 = line_end scan
+4:
+    cmp x3, x2
+    b.hs 5f
+    ldrb w4, [x3]
+    cbz w4, 5f
+    cmp w4, #10
+    b.eq 5f
+    add x3, x3, #1
+    b 4b
+5:
+    // x1 = pos (file_echo_pos), clamp into SOURCE
+    adrp x4, file_echo_pos@page
+    add x4, x4, file_echo_pos@pageoff
+    ldr x0, [x4]                   // x0 = pos (reuse x0; target no longer needed)
+    adrp x1, source_addr@page
+    add x1, x1, source_addr@pageoff
+    ldr x1, [x1]
+    cmp x0, x1
+    csel x0, x1, x0, lo
+    cmp x0, x2
+    csel x0, x2, x0, hi
+    // if pos > line_end, already echoed through this line
+    cmp x0, x3
+    b.hi _fe_done
+    // write [pos, line_end): x0=pos, x3=line_end
+    mov x1, x0                     // buf = pos
+    subs x2, x3, x1                // len = line_end - pos
+    b.eq 6f
+    mov x0, #1                     // stdout
+    mov x16, #4
+    svc #0x80
+6:
+    // If line ends with \n, print it and advance past; else add \n for display
+    adrp x0, source_addr@page
+    add x0, x0, source_addr@pageoff
+    ldr x0, [x0]
+    adrp x1, source_len@page
+    add x1, x1, source_len@pageoff
+    ldr x1, [x1]
+    add x0, x0, x1                 // source end
+    cmp x3, x0
+    b.hs 7f
+    ldrb w1, [x3]
+    cmp w1, #10
+    b.ne 7f
+    mov x0, #10
+    bl _putchar
+    add x3, x3, #1
+    adrp x4, file_echo_pos@page
+    add x4, x4, file_echo_pos@pageoff
+    str x3, [x4]
+    b _fe_done
+7:
+    // No trailing newline in source (last line): print one for the console
+    mov x0, #10
+    bl _putchar
+    adrp x4, file_echo_pos@page
+    add x4, x4, file_echo_pos@pageoff
+    str x3, [x4]
+_fe_done:
+    ldp x29, x30, [sp], #16
+    ret
+
+// _push_source: save current SOURCE/>IN/SOURCE-ID/file_echo_pos on source_stack.
+// Frame = 5 quads (addr, len, >IN, source-id, file_echo_pos). Clobbers x0-x3.
 // Returns x0=1 ok, x0=0 overflow.
 _push_source:
     adrp x0, source_sp@page
@@ -3392,12 +3539,12 @@ _push_source:
     ldr x1, [x0]
     cmp x1, #8
     b.hs 1f
-    mov x2, #32                    // 4*8 per frame
+    mov x2, #40                    // 5*8 per frame
     mul x3, x1, x2
     adrp x2, source_stack@page
     add x2, x2, source_stack@pageoff
     add x2, x2, x3
-    // store addr, len, to_in, source_id
+    // store addr, len, to_in, source_id, file_echo_pos
     adrp x3, source_addr@page
     add x3, x3, source_addr@pageoff
     ldr x3, [x3]
@@ -3413,6 +3560,10 @@ _push_source:
     adrp x3, source_id_var@page
     add x3, x3, source_id_var@pageoff
     ldr x3, [x3]
+    str x3, [x2], #8
+    adrp x3, file_echo_pos@page
+    add x3, x3, file_echo_pos@pageoff
+    ldr x3, [x3]
     str x3, [x2]
     add x1, x1, #1
     str x1, [x0]
@@ -3422,7 +3573,7 @@ _push_source:
     mov x0, #0
     ret
 
-// _pop_source: restore SOURCE/>IN/SOURCE-ID. x0=1 ok, x0=0 underflow.
+// _pop_source: restore SOURCE/>IN/SOURCE-ID/file_echo_pos. x0=1 ok, x0=0 underflow.
 _pop_source:
     adrp x0, source_sp@page
     add x0, x0, source_sp@pageoff
@@ -3430,7 +3581,7 @@ _pop_source:
     cbz x1, 1f
     sub x1, x1, #1
     str x1, [x0]
-    mov x2, #32
+    mov x2, #40
     mul x3, x1, x2
     adrp x2, source_stack@page
     add x2, x2, source_stack@pageoff
@@ -3452,9 +3603,13 @@ _pop_source:
     adrp x0, word_cursor@page
     add x0, x0, word_cursor@pageoff
     str x4, [x0]
-    ldr x3, [x2]
+    ldr x3, [x2], #8
     adrp x0, source_id_var@page
     add x0, x0, source_id_var@pageoff
+    str x3, [x0]
+    ldr x3, [x2]
+    adrp x0, file_echo_pos@page
+    add x0, x0, file_echo_pos@pageoff
     str x3, [x0]
     mov x0, #1
     ret
@@ -4734,6 +4889,8 @@ tty_termios_raw:  .skip 80
 tty_raw_active:   .quad 0
 redef_warn:       .quad 0           // REDEF-WARNING body; 0=off, nonzero=on (TRUE after boot)
 redef_boot_done:  .quad 0           // set after first QUIT so default TRUE applied once
+file_echo:        .quad 0           // FILE-ECHO body; 0=off, nonzero=on
+file_echo_pos:    .quad 0           // absolute addr: next source byte not yet echoed
 // Line history (see HIST_MAX / HIST_LINE)
 hist_data:        .skip HIST_MAX * HIST_LINE
 hist_draft:       .skip HIST_LINE
@@ -4752,8 +4909,8 @@ source_len:     .quad 0
 to_in_var:      .quad 0
 pad_buffer:     .skip 256
 hold_ptr:       .quad 0
-// Nested SOURCE stack: 8 frames * 4 quads (addr, len, >IN, source-id)
-source_stack:   .skip 256
+// Nested SOURCE stack: 8 frames * 5 quads (addr, len, >IN, source-id, file_echo_pos)
+source_stack:   .skip 320
 source_sp:      .quad 0
 source_id_var:  .quad 0
 throw_handler:  .quad 0
@@ -4802,6 +4959,8 @@ str_prompt: .asciz "\nok> "
 str_ok:     .asciz " ok\n"
 str_bye:    .asciz "Bye!\n"
 str_quest:  .asciz "? "
+str_cant_open:  .ascii "can't open: "
+                .byte 0
 str_undefined:  .ascii "undefined: "
                 .byte 0
 str_underflow:  .asciz "stack underflow\n"
@@ -4971,6 +5130,9 @@ forth_init_str:
     // ANEW <name>  marker for reloadable modules (classic FPC/Win32Forth style).
     // First time: CREATE name. Later: EXECUTE name (DOES> FORGETs itself) then re-CREATE.
     .ascii ": ANEW >IN @ >R BL WORD FIND IF EXECUTE ELSE DROP THEN R> >IN ! CREATE LATEST @ , DOES> @ DUP @ LATEST ! DUP HERE - ALLOT DROP ; "
+    // ON / OFF — store 1 or 0 at addr (classic: FILE-ECHO ON  /  FILE-ECHO OFF)
+    .ascii ": ON 1 SWAP ! ; "
+    .ascii ": OFF 0 SWAP ! ; "
 
     .byte 0  // null terminator
 
@@ -6048,6 +6210,14 @@ dict_environment_q:  // ENVIRONMENT? ( c-addr u -- false | i*x true )
     .quad XENVIRONMENT_Q
     .asciz "ENVIRONMENT?"
     .space 4
+
+.align 8
+dict_file_echo:  // FILE-ECHO ( -- addr )  echo INCLUDE lines when nonzero
+    .quad dict_environment_q
+    .quad 9
+    .quad XFILE_ECHO
+    .asciz "FILE-ECHO"
+    .space 7
 
 // ============================================================================
 // User dictionary space (grows upward)
