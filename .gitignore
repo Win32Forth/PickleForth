@@ -1,6 +1,7 @@
 # Build products
 pickleforth
 pickleforth_debug
+pickleforth_rel
 *.o
 *.out
 
