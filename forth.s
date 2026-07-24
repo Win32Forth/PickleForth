@@ -2393,6 +2393,10 @@ _word_not_found:
     // Print newline
     mov x0, #10
     bl _putchar
+    // Abort colon definition if we were compiling (leave interpret mode)
+    adrp x0, state_var@page
+    add x0, x0, state_var@pageoff
+    str xzr, [x0]
     b _interpret_loop
 
 // End of current SOURCE: pop nested source (INCLUDE/EVALUATE) or finish line
@@ -3221,10 +3225,13 @@ forth_init_str:
     .ascii ": CMOVE> DUP >R + 1- SWAP R@ + 1- SWAP R> BEGIN DUP WHILE >R OVER C@ OVER C! 1- SWAP 1- SWAP R> 1- REPEAT DROP 2DROP ; "
     .ascii ": MOVE DUP 0= IF DROP 2DROP EXIT THEN >R 2DUP U< IF R> CMOVE> ELSE R> CMOVE THEN ; "
 
-    // POSTPONE (ANS): imm → compile xt; non-imm → compile LIT xt ,
-    .ascii ": POSTPONE BL WORD FIND DUP 0= IF 2DROP EXIT THEN 1 = IF , ELSE LIT-ADDR , , ['] , , THEN ; IMMEDIATE "
+    // POSTPONE (ANS, compilation only):
+    //   immediate:     compile xt (runs when outer word runs)
+    //   non-immediate: compile LIT xt (COMP,)  so runtime compiles xt via ,
+    .ascii ": (COMP,) , ; "
+    .ascii ": POSTPONE STATE @ 0= IF EXIT THEN BL WORD FIND DUP 0= IF 2DROP EXIT THEN 1 = IF , ELSE LIT-ADDR , , ['] (COMP,) , THEN ; IMMEDIATE "
 
-    // CASE OF ENDOF ENDCASE (ANS-style)
+    // CASE OF ENDOF ENDCASE (ANS-style; compilation only)
     .ascii ": CASE 0 ; IMMEDIATE "
     .ascii ": OF 1+ >R POSTPONE OVER POSTPONE = POSTPONE IF POSTPONE DROP R> ; IMMEDIATE "
     .ascii ": ENDOF >R POSTPONE ELSE R> ; IMMEDIATE "
