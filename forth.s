@@ -49,11 +49,12 @@
 //   Comments: \  (
 //   I/O: EMIT KEY CR TYPE SPACE SPACES . U.
 //   Stack probe: SP0 SP@ ; DEPTH is high-level (SEE-able)
-//   Double-ish: S>D 2* 2/
+//   Double: S>D 2* 2/ 2@ 2! UM* M* UM/MOD SM/REM FM/MOD */MOD */
 //   Numeric input honors BASE; DECIMAL HEX
 //   Compile: : ; CREATE VARIABLE CONSTANT , ALLOT HERE [ ] IMMEDIATE
 //            LITERAL ' ['] EXECUTE RECURSE
 //   Control: IF ELSE THEN BEGIN UNTIL AGAIN WHILE REPEAT EXIT
+//   Outer: QUIT (CODE) ABORT ABORT" (high-level)
 //
 // Present but non-ANS or different (fix later):
 //   FIND     — ANS shape (counted string; 1=imm / -1=non-imm / 0=missing)
@@ -67,16 +68,15 @@
 //   CELL     — push 8; not an ANS word (CELL+ / CELLS are ANS)
 //
 // Still missing major ANS Core pieces:
-//   ABORT ABORT" QUIT  >NUMBER ACCEPT ENVIRONMENT?
-//   UM* UM/MOD M* SM/REM FM/MOD */ */MOD
-//   REFILL C" VALUE TO  (and more Core Ext)
+//   C" VALUE TO  (and more Core Ext)
+// Batch-6: ACCEPT >NUMBER ENVIRONMENT? REFILL SOURCE-ID
 //
 // Batch-1: S" ."  ANS FIND  SOURCE  >IN
 // Batch-2: DO LOOP +LOOP I J LEAVE UNLOOP  DOES>  pictured numeric
 // Batch-3: POSTPONE  MOVE CMOVE CMOVE>  CASE OF ENDOF ENDCASE
 //          EVALUATE (nested SOURCE)  CATCH THROW
 // Batch-4: SPACES C, S>D 2* 2/ 2@ 2!  (CODE); DEPTH is high-level via SP0/SP@
-// Next Core priority: double-cell math (UM* UM/MOD M* SM/REM FM/MOD */ */MOD)
+// Batch-5 double-cell: UM* M* UM/MOD SM/REM FM/MOD (CODE); */MOD */ high-level
 //   Note: DO/LOOP are compilation words (use inside : defs). CREATE body is
 //   does_ip at +0, user PFA at +8 (DOVAR/DODOES/DOCON aware).
 //   EVALUATE nests SOURCE via a stack (also used by INCLUDE/FLOAD).
@@ -173,8 +173,8 @@ _main:
     mov  x20, #0
 
     // Initialize latest_var to newest static word
-    adrp x0, dict_twostore@page
-    add  x0, x0, dict_twostore@pageoff
+    adrp x0, dict_environment_q@page
+    add  x0, x0, dict_environment_q@pageoff
     str  x0, [x24]
 
     // HERE = user_dict_area
@@ -183,6 +183,9 @@ _main:
     adrp x1, user_dict_area@page
     add  x1, x1, user_dict_area@pageoff
     str  x1, [x0]
+
+    // Catch SIGSEGV/SIGBUS (e.g. @ on address 0) and return to QUIT
+    bl _install_fault_handlers
 
     // Patch all dict entry code fields (Mach-O chained fixups broken for .quad cross-section refs)
     bl _patch_dict
@@ -209,6 +212,44 @@ _main:
     mov x1, x2                      // len
     bl _set_source
     b _interpret_loop
+
+// ---------------------------------------------------------------------------
+// Fault recovery: SIGSEGV / SIGBUS → message → QUIT (no process death)
+// Does not slow primitives; only runs if a memory fault occurs.
+// ---------------------------------------------------------------------------
+_install_fault_handlers:
+    stp x29, x30, [sp, #-16]!
+    adrp x0, fault_handlers_on@page
+    add x0, x0, fault_handlers_on@pageoff
+    ldr x1, [x0]
+    cbnz x1, 1f
+    mov x1, #1
+    str x1, [x0]
+    mov x0, #11                    // SIGSEGV
+    adrp x1, _fault_handler@page
+    add x1, x1, _fault_handler@pageoff
+    bl _signal
+    mov x0, #10                    // SIGBUS
+    adrp x1, _fault_handler@page
+    add x1, x1, _fault_handler@pageoff
+    bl _signal
+1:
+    ldp x29, x30, [sp], #16
+    ret
+
+// async-signal-safe: write(2) + siglongjmp only
+.align 4
+_fault_handler:
+    mov x0, #2                     // stderr
+    adrp x1, str_memfault@page
+    add x1, x1, str_memfault@pageoff
+    mov x2, #20                    // "memory access error\n"
+    mov x16, #4
+    svc #0x80
+    adrp x0, quit_jmpbuf@page
+    add x0, x0, quit_jmpbuf@pageoff
+    mov x1, #1
+    bl _siglongjmp                 // does not return
 
 // ============================================================================
 // DOCOL / DOEXIT / DOVAR
@@ -490,7 +531,9 @@ _patch_dict:
     nop
 
     // Patch new compilation primitives
-    PATCH_LINK dict_here, dict_lbrack
+    PATCH_LINK dict_dp, dict_lbrack
+    nop
+    PATCH_LINK dict_here, dict_dp
     nop
     PATCH_LINK dict_alot, dict_here
     nop
@@ -515,6 +558,8 @@ _patch_dict:
     PATCH_LINK dict_branch, dict_0branch
     nop
 
+    PATCH_CODE dict_dp, XDP
+    nop
     PATCH_CODE dict_here, XHERE
     nop
     PATCH_CODE dict_alot, XALLOT
@@ -731,7 +776,11 @@ _patch_dict:
     nop
     PATCH_CODE dict_spfetch, XSPFETCH
     nop
-    PATCH_LINK dict_spaces, dict_spfetch
+    PATCH_LINK dict_spstore, dict_spfetch
+    nop
+    PATCH_CODE dict_spstore, XSPSTORE
+    nop
+    PATCH_LINK dict_spaces, dict_spstore
     nop
     PATCH_CODE dict_spaces, XSPACES
     nop
@@ -759,6 +808,52 @@ _patch_dict:
     nop
     PATCH_CODE dict_twostore, XTWOSTORE
     nop
+    // Double-cell suite
+    PATCH_LINK dict_umstar, dict_twostore
+    nop
+    PATCH_CODE dict_umstar, XUMSTAR
+    nop
+    PATCH_LINK dict_mstar, dict_umstar
+    nop
+    PATCH_CODE dict_mstar, XMSTAR
+    nop
+    PATCH_LINK dict_ummod, dict_mstar
+    nop
+    PATCH_CODE dict_ummod, XUMMOD
+    nop
+    PATCH_LINK dict_smrem, dict_ummod
+    nop
+    PATCH_CODE dict_smrem, XSMREM
+    nop
+    PATCH_LINK dict_fmmod, dict_smrem
+    nop
+    PATCH_CODE dict_fmmod, XFMMOD
+    nop
+    PATCH_LINK dict_quit, dict_fmmod
+    nop
+    PATCH_CODE dict_quit, XQUIT
+    nop
+    // Group 3: SOURCE-ID REFILL ACCEPT >NUMBER ENVIRONMENT?
+    PATCH_LINK dict_source_id, dict_quit
+    nop
+    PATCH_CODE dict_source_id, XSOURCE_ID
+    nop
+    PATCH_LINK dict_refill, dict_source_id
+    nop
+    PATCH_CODE dict_refill, XREFILL
+    nop
+    PATCH_LINK dict_accept, dict_refill
+    nop
+    PATCH_CODE dict_accept, XACCEPT
+    nop
+    PATCH_LINK dict_to_number, dict_accept
+    nop
+    PATCH_CODE dict_to_number, XTONUMBER
+    nop
+    PATCH_LINK dict_environment_q, dict_to_number
+    nop
+    PATCH_CODE dict_environment_q, XENVIRONMENT_Q
+    nop
 
     .purgem PATCH_CODE
     .purgem PATCH_LINK
@@ -767,6 +862,8 @@ _patch_dict:
 // ============================================================================
 // Stack Primitives
 // ============================================================================
+// Note: no per-primitive stack checks (performance). The outer interpreter
+// validates the data stack between words via _check_stack.
 XDUP:
     str x20, [x22, #-8]!
     NEXT
@@ -1059,8 +1156,6 @@ XDOT:
     mov x0, x20
     ldr x20, [x22], #8
     SAVE_VM
-    // x0 was clobbered by SAVE_VM? No — SAVE_VM only stores x19-x24.
-    // But we need the value: it is still in x0 until something overwrites it.
     bl _print_signed
     mov x0, #32
     bl _putchar
@@ -1121,7 +1216,15 @@ XLit:
 // Compilation Primitives
 // ============================================================================
 
-// HERE ( -- addr ) push current dictionary pointer
+// DP ( -- a-addr )  address of the dictionary pointer cell (ANS-style)
+XDP:
+    str x20, [x22, #-8]!
+    adrp x0, here_ptr@page
+    add x0, x0, here_ptr@pageoff
+    mov x20, x0
+    NEXT
+
+// HERE ( -- addr ) push current dictionary pointer (also : HERE DP @ ;)
 XHERE:
     DPUSH
     adrp x0, here_ptr@page
@@ -1490,6 +1593,11 @@ _include_done_restore:
     mov x1, #0
 2:
     bl _set_source
+    // SOURCE-ID = 1 (text file / INCLUDE buffer; fd already closed)
+    adrp x0, source_id_var@page
+    add x0, x0, source_id_var@pageoff
+    mov x1, #1
+    str x1, [x0]
     ldp x25, x26, [sp], #16
     RESTORE_VM
     NEXT
@@ -1807,6 +1915,13 @@ XSPFETCH:
     mov x20, x0
     NEXT
 
+// SP! ( addr -- )  set data-stack pointer (DSP). TOS becomes 0 (empty cache).
+// Classic empty: SP0 SP!   (same as clearing the data stack)
+XSPSTORE:
+    mov x22, x20
+    mov x20, #0
+    NEXT
+
 // SPACES ( n -- )  emit n spaces (n<=0: no-op)
 XSPACES:
     mov x1, x20
@@ -1868,6 +1983,189 @@ XTWOSTORE:
     ldr x20, [x22], #8
     str x1, [x0]
     str x2, [x0, #8]
+    NEXT
+
+// ============================================================================
+// Double-cell arithmetic (ANS Core)
+// Doubles on stack: lo under, hi in TOS (same as S>D).
+// ============================================================================
+
+// UM* ( u1 u2 -- ud )  unsigned multiply → double
+XUMSTAR:
+    mov x1, x20                    // u2
+    ldr x0, [x22], #8              // u1
+    mul x2, x0, x1                 // lo
+    umulh x20, x0, x1              // hi
+    str x2, [x22, #-8]!            // lo under
+    NEXT
+
+// M* ( n1 n2 -- d )  signed multiply → double
+XMSTAR:
+    mov x1, x20
+    ldr x0, [x22], #8
+    mul x2, x0, x1
+    smulh x20, x0, x1
+    str x2, [x22, #-8]!
+    NEXT
+
+// _udivmod128: unsigned (x1:x0) / x2 → quot x3, rem x4
+// Pre: x2 != 0. If x1 >= x2 (quotient won't fit 64 bits), returns quot=-1, rem=x0.
+// Invariant long division: remainder always restored to < divisor (at most one sub
+// after 2*r+bit, with overflow handling when r's top bit was set).
+_udivmod128:
+    cbz x2, _udm_div0
+    cmp x1, x2
+    b.hs _udm_ovf
+    mov x3, xzr                    // quot
+    mov x4, xzr                    // rem
+    mov x5, #128                   // bit index 127..0
+_udm_bit:
+    sub x5, x5, #1
+    // bit = bit x5 of (x1:x0)
+    cmp x5, #64
+    b.hs 1f
+    lsr x6, x0, x5
+    b 2f
+1:
+    sub x7, x5, #64
+    lsr x6, x1, x7
+2:
+    and x6, x6, #1
+    // ov = rem top bit before shift
+    lsr x7, x4, #63
+    lsl x4, x4, #1
+    orr x4, x4, x6
+    lsl x3, x3, #1
+    // if ov || rem >= div: rem -= div, quot |= 1
+    cbnz x7, 3f
+    cmp x4, x2
+    b.lo 4f
+3:
+    sub x4, x4, x2
+    orr x3, x3, #1
+4:
+    cbnz x5, _udm_bit
+    ret
+_udm_div0:
+_udm_ovf:
+    mov x3, #-1
+    mov x4, x0
+    ret
+
+// UM/MOD ( ud u1 -- u2 u3 )  urem uquot ; ud = ulo under, uhi TOS before u1
+XUMMOD:
+    mov x2, x20                    // u1 divisor
+    ldr x1, [x22], #8              // uhi
+    ldr x0, [x22], #8              // ulo
+    // prior TOS now at [x22]; compute
+    stp x0, x1, [sp, #-16]!        // save dividend for clarity
+    // x0,x1,x2 already set
+    bl _udivmod128
+    add sp, sp, #16
+    // stack: push rem, TOS=quot. Prior stack item still at [x22].
+    str x4, [x22, #-8]!            // rem under
+    mov x20, x3                    // quot
+    NEXT
+
+// SM/REM ( d1 n1 -- n2 n3 )  symmetric (toward 0) rem, quot
+// d1 = dlo under, dhi TOS before n1
+XSMREM:
+    mov x5, x20                    // n1 (signed divisor)
+    ldr x4, [x22], #8              // dhi
+    ldr x3, [x22], #8              // dlo
+    // signs on stack (x6/x7 clobbered by _udivmod128)
+    cmp x4, #0
+    cset x6, lt                    // sign dividend
+    cmp x5, #0
+    cset x7, lt                    // sign divisor
+    stp x6, x7, [sp, #-16]!
+    str x5, [sp, #-16]!            // keep signed divisor (unused here)
+    // abs dividend → x1:x0
+    mov x0, x3
+    mov x1, x4
+    cbz x6, 1f
+    mvn x0, x0
+    mvn x1, x1
+    adds x0, x0, #1
+    adc x1, x1, xzr
+1:
+    mov x2, x5
+    cbz x7, 2f
+    neg x2, x2
+2:
+    cbz x2, 3f
+    bl _udivmod128
+    ldp x5, xzr, [sp], #16         // drop saved divisor slot
+    ldp x6, x7, [sp], #16          // restore signs
+    // rem sign = dividend; quot sign = xor
+    cbz x6, 4f
+    neg x4, x4
+4:
+    eor x8, x6, x7
+    cbz x8, 5f
+    neg x3, x3
+5:
+    str x4, [x22, #-8]!
+    mov x20, x3
+    NEXT
+3:
+    add sp, sp, #32
+    mov x3, #-1
+    mov x4, xzr
+    str x4, [x22, #-8]!
+    mov x20, x3
+    NEXT
+
+// FM/MOD ( d1 n1 -- n2 n3 )  floored rem, quot
+// Like SM/REM then if rem!=0 and rem/divisor different signs: q--, r+=divisor
+XFMMOD:
+    mov x5, x20
+    ldr x4, [x22], #8
+    ldr x3, [x22], #8
+    cmp x4, #0
+    cset x6, lt
+    cmp x5, #0
+    cset x7, lt
+    stp x6, x7, [sp, #-16]!
+    str x5, [sp, #-16]!            // signed divisor for floor adjust
+    mov x0, x3
+    mov x1, x4
+    cbz x6, 1f
+    mvn x0, x0
+    mvn x1, x1
+    adds x0, x0, #1
+    adc x1, x1, xzr
+1:
+    mov x2, x5
+    cbz x7, 2f
+    neg x2, x2
+2:
+    cbz x2, 9f
+    bl _udivmod128
+    ldr x5, [sp], #16              // divisor
+    ldp x6, x7, [sp], #16          // signs
+    cbz x6, 3f
+    neg x4, x4
+3:
+    eor x8, x6, x7
+    cbz x8, 4f
+    neg x3, x3
+4:
+    cbz x4, 5f
+    eor x8, x4, x5
+    tbz x8, #63, 5f                // same sign → done
+    sub x3, x3, #1
+    add x4, x4, x5
+5:
+    str x4, [x22, #-8]!
+    mov x20, x3
+    NEXT
+9:
+    add sp, sp, #32
+    mov x3, #-1
+    mov x4, xzr
+    str x4, [x22, #-8]!
+    mov x20, x3
     NEXT
 
 // CONTAINS ( hay-a hay-u ned-a ned-u -- flag )
@@ -1933,6 +2231,11 @@ XEVALUATE:
     bl _push_source
     ldp x0, x1, [sp], #16
     bl _set_source
+    // SOURCE-ID = -1 (string)
+    adrp x0, source_id_var@page
+    add x0, x0, source_id_var@pageoff
+    mov x1, #-1
+    str x1, [x0]
     b _interpret_loop
 
 // CATCH ( i*x xt -- j*x 0 | i*x n )
@@ -1997,12 +2300,17 @@ _throw_zero:
     ldr x20, [x22], #8
     NEXT
 _throw_abort:
-    mov x0, #1
-    adrp x1, str_quest@page
-    add x1, x1, str_quest@pageoff
-    mov x2, #2
-    mov x16, #4
-    svc #0x80
+    // Uncaught THROW: empty data stack, then QUIT (no message here).
+    adrp x22, data_stack@page
+    add x22, x22, data_stack@pageoff
+    add x22, x22, #4096
+    mov x20, #0
+    b _do_quit
+
+// QUIT ( -- )  ANS outer interpreter entry (CODE — not a colon trampoline).
+// Empty return stack, interpret state, existing prompt/line/interpret loop.
+// Does not empty the data stack (ANS); ABORT clears the data stack first.
+XQUIT:
     b _do_quit
 
 // PARSE ( char "ccc<char>" -- c-addr u )
@@ -2191,6 +2499,220 @@ XSOURCE:
     adrp x0, source_len@page
     add x0, x0, source_len@pageoff
     ldr x20, [x0]
+    NEXT
+
+// SOURCE-ID ( -- 0 | -1 | fileid )  ANS
+// 0 = user input device, -1 = EVALUATE string, >0 = file-ish INCLUDE buffer
+XSOURCE_ID:
+    str x20, [x22, #-8]!
+    adrp x0, source_id_var@page
+    add x0, x0, source_id_var@pageoff
+    ldr x20, [x0]
+    NEXT
+
+// REFILL ( -- flag )  ANS
+// Terminal: read a line into input_buffer, make it SOURCE, true (false on EOF).
+// EVALUATE (SOURCE-ID = -1): always false.
+// INCLUDE buffer (SOURCE-ID > 0): false (whole file already in SOURCE).
+XREFILL:
+    adrp x0, source_id_var@page
+    add x0, x0, source_id_var@pageoff
+    ldr x0, [x0]
+    cmp x0, #0
+    b.ne _refill_false
+    adrp x0, input_buffer@page
+    add x0, x0, input_buffer@pageoff
+    mov x1, #1023
+    SAVE_VM
+    bl _read_line
+    RESTORE_VM
+    cbz x0, _refill_eof
+    adrp x0, input_buffer@page
+    add x0, x0, input_buffer@pageoff
+    mov x1, #0
+1:
+    ldrb w2, [x0, x1]
+    cbz w2, 2f
+    add x1, x1, #1
+    b 1b
+2:
+    bl _set_source
+    adrp x0, source_id_var@page
+    add x0, x0, source_id_var@pageoff
+    str xzr, [x0]
+    str x20, [x22, #-8]!
+    mov x20, #-1
+    NEXT
+_refill_eof:
+_refill_false:
+    str x20, [x22, #-8]!
+    mov x20, #0
+    NEXT
+
+// ACCEPT ( c-addr +n1 -- +n2 )  ANS
+// Receive a string of at most +n1 characters into c-addr; return count.
+// Uses the line editor when stdin is a TTY.
+XACCEPT:
+    // ( c-addr +n1 )  TOS=+n1
+    mov x1, x20                    // +n1
+    ldr x0, [x22], #8              // c-addr; x22 -> prior TOS cell
+    cmp x1, #0
+    b.gt 1f
+    mov x20, #0                    // +n2 = 0
+    NEXT
+1:
+    // Save VM + args; _read_line uses x19-x26
+    stp x29, x30, [sp, #-16]!
+    stp x19, x20, [sp, #-16]!
+    stp x21, x22, [sp, #-16]!
+    stp x23, x24, [sp, #-16]!
+    stp x0, x1, [sp, #-16]!        // c-addr, +n1
+    mov x19, x0
+    add x1, x1, #1                 // room for NUL
+    mov x0, x19
+    bl _read_line
+    mov x2, x0                     // buf or 0
+    ldp x0, x1, [sp], #16          // c-addr, +n1
+    mov x3, #0                     // len
+    cbz x2, 3f
+2:
+    cmp x3, x1
+    b.hs 3f
+    ldrb w4, [x2, x3]
+    cbz w4, 3f
+    add x3, x3, #1
+    b 2b
+3:
+    ldp x23, x24, [sp], #16
+    ldp x21, x22, [sp], #16
+    ldp x19, x20, [sp], #16
+    ldp x29, x30, [sp], #16
+    // x22 restored to post-c-addr-pop (prior under); TOS = n2
+    mov x20, x3
+    NEXT
+
+// >NUMBER ( ud1 c-addr1 u1 -- ud2 c-addr2 u2 )  ANS
+// Convert digits from string in BASE into double ud1; leave rest of string.
+// ud is lo under, hi TOS (same as S>D). Character set: 0-9A-Z (case-insensitive).
+XTONUMBER:
+    // stack: ( udlo udhi c-addr u )  TOS=u
+    mov x4, x20                    // u
+    ldr x3, [x22], #8              // c-addr
+    ldr x2, [x22], #8              // udhi
+    ldr x1, [x22], #8              // udlo
+    // BASE
+    adrp x5, base_var@page
+    add x5, x5, base_var@pageoff
+    ldr x5, [x5]
+    cmp x5, #2
+    b.lo 8f
+    cmp x5, #36
+    b.ls 9f
+8:
+    mov x5, #10
+9:
+_tn_loop:
+    cbz x4, _tn_done
+    ldrb w6, [x3]
+    // digit value
+    sub w7, w6, #48
+    cmp w7, #9
+    b.ls _tn_dig
+    mov w7, w6
+    cmp w7, #'a'
+    b.lo _tn_up
+    cmp w7, #'z'
+    b.hi _tn_stop
+    sub w7, w7, #32
+_tn_up:
+    sub w7, w7, #'A'
+    cmp w7, #25
+    b.hi _tn_stop
+    add w7, w7, #10
+_tn_dig:
+    cmp x7, x5
+    b.hs _tn_stop
+    // ud = ud * base + digit  (128-bit)
+    // (x2:x1) * x5 + x7
+    mul x8, x1, x5                 // lo*base low
+    umulh x9, x1, x5               // lo*base high
+    mul x10, x2, x5                // hi*base low (ignore hi*base high overflow)
+    add x9, x9, x10
+    adds x1, x8, x7
+    adc x2, x9, xzr
+    add x3, x3, #1
+    sub x4, x4, #1
+    b _tn_loop
+_tn_stop:
+_tn_done:
+    // push udlo udhi c-addr u
+    str x1, [x22, #-8]!
+    str x2, [x22, #-8]!
+    str x3, [x22, #-8]!
+    mov x20, x4
+    NEXT
+
+// ENVIRONMENT? ( c-addr u -- false | i*x true )  ANS
+// Recognized queries (minimal Core set + a few useful ones):
+//   /COUNTED-STRING  ADDRESS-UNIT-BITS  CORE  CORE-EXT  FLOORED
+//   MAX-CHAR  MAX-N  MAX-U  RETURN-STACK-CELLS  STACK-CELLS
+XENVIRONMENT_Q:
+    mov x1, x20                    // u
+    ldr x0, [x22], #8              // c-addr
+    // x0/x1 = query string; scan env_name_ptrs table
+    mov x4, #0                     // index
+_env_next:
+    // load name pointer and length from table: each entry is .quad ptr, .quad len, then next
+    // Simpler: fixed table of asciz names, parallel values
+    cmp x4, #10                    // ENV_COUNT
+    b.hs _env_no
+    // name at env_name_ptrs[x4]
+    adrp x5, env_name_ptrs@page
+    add x5, x5, env_name_ptrs@pageoff
+    ldr x5, [x5, x4, lsl #3]
+    // strlen name
+    mov x6, #0
+1:
+    ldrb w7, [x5, x6]
+    cbz w7, 2f
+    add x6, x6, #1
+    b 1b
+2:
+    cmp x6, x1
+    b.ne _env_cont
+    // compare bytes case-sensitive (ANS names are uppercase)
+    mov x7, #0
+3:
+    cmp x7, x6
+    b.eq _env_yes
+    ldrb w8, [x5, x7]
+    ldrb w9, [x0, x7]
+    cmp w8, w9
+    b.ne _env_cont
+    add x7, x7, #1
+    b 3b
+_env_cont:
+    add x4, x4, #1
+    b _env_next
+_env_yes:
+    // value kind in env_kinds[x4]: 0 = flag true only, 1 = single cell then true
+    adrp x5, env_kinds@page
+    add x5, x5, env_kinds@pageoff
+    ldrb w5, [x5, x4]
+    adrp x6, env_values@page
+    add x6, x6, env_values@pageoff
+    ldr x6, [x6, x4, lsl #3]
+    cbz w5, _env_flag_only
+    // push value, then true
+    str x6, [x22, #-8]!
+    mov x20, #-1
+    NEXT
+_env_flag_only:
+    // boolean query: value is the flag (-1 present / 0 absent)
+    mov x20, x6
+    NEXT
+_env_no:
+    mov x20, #0
     NEXT
 
 // >IN ( -- a-addr )  ANS variable
@@ -2515,11 +3037,24 @@ _cs_pad:
 // ============================================================================
 .align 4
 _do_quit:
+    // Empty return stack; clear CATCH nesting
     adrp x23, return_stack@page
     add  x23, x23, return_stack@pageoff
     add  x23, x23, #2048
+    adrp x0, throw_handler@page
+    add  x0, x0, throw_handler@pageoff
+    str  xzr, [x0]
+    // Interpret state
     adrp x0, state_var@page
     add  x0, x0, state_var@pageoff
+    str  xzr, [x0]
+    // Pop any nested SOURCE (EVALUATE / INCLUDE) back to base
+    adrp x0, source_sp@page
+    add  x0, x0, source_sp@pageoff
+    str  xzr, [x0]
+    // Terminal is the input source
+    adrp x0, source_id_var@page
+    add  x0, x0, source_id_var@pageoff
     str  xzr, [x0]
 
 _quit_loop:
@@ -2540,6 +3075,35 @@ _quit_loop:
     add x22, x22, #4096
     mov x20, #0
 1:
+    // Refresh fault recovery point (siglongjmp lands here after SIGSEGV/SIGBUS)
+    adrp x0, quit_jmpbuf@page
+    add x0, x0, quit_jmpbuf@pageoff
+    mov x1, #1                     // save signal mask
+    bl _sigsetjmp
+    cbz x0, 2f
+    // Returned from fault handler: rebuild a clean outer-interpreter state
+    adrp x22, data_stack@page
+    add x22, x22, data_stack@pageoff
+    add x22, x22, #4096
+    mov x20, #0
+    adrp x23, return_stack@page
+    add x23, x23, return_stack@pageoff
+    add x23, x23, #2048
+    adrp x0, throw_handler@page
+    add x0, x0, throw_handler@pageoff
+    str xzr, [x0]
+    adrp x0, state_var@page
+    add x0, x0, state_var@pageoff
+    str xzr, [x0]
+    adrp x0, source_sp@page
+    add x0, x0, source_sp@pageoff
+    str xzr, [x0]
+    adrp x0, source_id_var@page
+    add x0, x0, source_id_var@pageoff
+    str xzr, [x0]
+    adrp x24, latest_var@page
+    add x24, x24, latest_var@pageoff
+2:
     // Print prompt via raw SVC
     mov x0, #1
     adrp x1, str_prompt@page
@@ -2566,8 +3130,15 @@ _quit_loop:
     b 1b
 2:
     bl _set_source
+    // User input device
+    adrp x0, source_id_var@page
+    add x0, x0, source_id_var@pageoff
+    str xzr, [x0]
 
 _interpret_loop:
+    // Between words: catch underflow/overflow from the previous word
+    bl _check_stack
+
     bl _next_word
     cbz x1, _interpret_empty
 
@@ -2657,25 +3228,78 @@ _compile_entry:
     b _interpret_loop
 
 _word_not_found:
-    // Write "? " via SVC
+    // "undefined: <word>\n"
     mov x0, #1
-    adrp x1, str_quest@page
-    add x1, x1, str_quest@pageoff
-    mov x2, #2
+    adrp x1, str_undefined@page
+    add x1, x1, str_undefined@pageoff
+    mov x2, #11                    // "undefined: "
     mov x16, #4
     svc #0x80
-    // Print word via SVC
     adrp x0, word_scratch@page
     add x0, x0, word_scratch@pageoff
     bl _print_string_svc
-    // Print newline
     mov x0, #10
     bl _putchar
-    // Abort colon definition if we were compiling (leave interpret mode)
+    b _error_abandon
+
+// Data-stack check between outer-interpreter words (not inside primitives).
+// Stack grows down; empty DSP = data_stack+4096. Underflow if DSP > SP0.
+// Also reject DSP below data_stack (overflow into other BSS).
+_check_stack:
+    adrp x0, data_stack@page
+    add x0, x0, data_stack@pageoff
+    add x1, x0, #4096              // SP0
+    cmp x22, x1
+    b.hi _stack_underflow          // DSP above empty → underflowed
+    cmp x22, x0
+    b.lo _stack_overflow           // DSP below buffer → overflow
+    ret
+
+_stack_underflow:
+    mov x0, #1
+    adrp x1, str_underflow@page
+    add x1, x1, str_underflow@pageoff
+    mov x2, #16                    // "stack underflow\n"
+    mov x16, #4
+    svc #0x80
+    b _stack_reset_abandon
+
+_stack_overflow:
+    mov x0, #1
+    adrp x1, str_overflow@page
+    add x1, x1, str_overflow@pageoff
+    mov x2, #15                    // "stack overflow\n"
+    mov x16, #4
+    svc #0x80
+_stack_reset_abandon:
+    adrp x22, data_stack@page
+    add x22, x22, data_stack@pageoff
+    add x22, x22, #4096
+    mov x20, #0
+    b _error_abandon
+
+// Shared: leave interpret, abandon rest of SOURCE, finish line
+_error_abandon:
     adrp x0, state_var@page
     add x0, x0, state_var@pageoff
     str xzr, [x0]
-    b _interpret_loop
+    adrp x0, source_len@page
+    add x0, x0, source_len@pageoff
+    ldr x0, [x0]
+    adrp x1, to_in_var@page
+    add x1, x1, to_in_var@pageoff
+    str x0, [x1]
+    adrp x0, source_addr@page
+    add x0, x0, source_addr@pageoff
+    ldr x0, [x0]
+    adrp x1, source_len@page
+    add x1, x1, source_len@pageoff
+    ldr x1, [x1]
+    add x0, x0, x1
+    adrp x1, word_cursor@page
+    add x1, x1, word_cursor@pageoff
+    str x0, [x1]
+    b _interpret_empty
 
 // End of current SOURCE: pop nested source (INCLUDE/EVALUATE) or finish line
 _interpret_empty:
@@ -2723,7 +3347,8 @@ _set_source:
     str x0, [x2]
     ret
 
-// _push_source: save current SOURCE/>IN on source_stack. Clobbers x0-x3.
+// _push_source: save current SOURCE/>IN/SOURCE-ID on source_stack.
+// Frame = 4 quads (addr, len, >IN, source-id). Clobbers x0-x3.
 // Returns x0=1 ok, x0=0 overflow.
 _push_source:
     adrp x0, source_sp@page
@@ -2731,12 +3356,12 @@ _push_source:
     ldr x1, [x0]
     cmp x1, #8
     b.hs 1f
-    mov x2, #24                    // 3*8 per frame
+    mov x2, #32                    // 4*8 per frame
     mul x3, x1, x2
     adrp x2, source_stack@page
     add x2, x2, source_stack@pageoff
     add x2, x2, x3
-    // store addr, len, to_in
+    // store addr, len, to_in, source_id
     adrp x3, source_addr@page
     add x3, x3, source_addr@pageoff
     ldr x3, [x3]
@@ -2748,6 +3373,10 @@ _push_source:
     adrp x3, to_in_var@page
     add x3, x3, to_in_var@pageoff
     ldr x3, [x3]
+    str x3, [x2], #8
+    adrp x3, source_id_var@page
+    add x3, x3, source_id_var@pageoff
+    ldr x3, [x3]
     str x3, [x2]
     add x1, x1, #1
     str x1, [x0]
@@ -2757,7 +3386,7 @@ _push_source:
     mov x0, #0
     ret
 
-// _pop_source: restore SOURCE/>IN. x0=1 ok, x0=0 underflow.
+// _pop_source: restore SOURCE/>IN/SOURCE-ID. x0=1 ok, x0=0 underflow.
 _pop_source:
     adrp x0, source_sp@page
     add x0, x0, source_sp@pageoff
@@ -2765,7 +3394,7 @@ _pop_source:
     cbz x1, 1f
     sub x1, x1, #1
     str x1, [x0]
-    mov x2, #24
+    mov x2, #32
     mul x3, x1, x2
     adrp x2, source_stack@page
     add x2, x2, source_stack@pageoff
@@ -2779,7 +3408,7 @@ _pop_source:
     adrp x0, source_len@page
     add x0, x0, source_len@pageoff
     str x3, [x0]
-    ldr x3, [x2]
+    ldr x3, [x2], #8
     adrp x0, to_in_var@page
     add x0, x0, to_in_var@pageoff
     str x3, [x0]
@@ -2787,6 +3416,10 @@ _pop_source:
     adrp x0, word_cursor@page
     add x0, x0, word_cursor@pageoff
     str x4, [x0]
+    ldr x3, [x2]
+    adrp x0, source_id_var@page
+    add x0, x0, source_id_var@pageoff
+    str x3, [x0]
     mov x0, #1
     ret
 1:
@@ -4083,17 +4716,65 @@ source_len:     .quad 0
 to_in_var:      .quad 0
 pad_buffer:     .skip 256
 hold_ptr:       .quad 0
-// Nested SOURCE stack: 8 frames * 3 quads (addr, len, >IN)
-source_stack:   .skip 192
+// Nested SOURCE stack: 8 frames * 4 quads (addr, len, >IN, source-id)
+source_stack:   .skip 256
 source_sp:      .quad 0
+source_id_var:  .quad 0
 throw_handler:  .quad 0
+
+// ENVIRONMENT? tables (name ptrs, value cells, kinds: 0=flag only, 1=value+true)
+.equ ENV_COUNT, 10
+.align 8
+env_name_ptrs:
+    .quad env_n_counted
+    .quad env_n_aub
+    .quad env_n_core
+    .quad env_n_core_ext
+    .quad env_n_floored
+    .quad env_n_maxchar
+    .quad env_n_maxn
+    .quad env_n_maxu
+    .quad env_n_rstack
+    .quad env_n_stack
+env_values:
+    .quad 255                      // /COUNTED-STRING
+    .quad 8                        // ADDRESS-UNIT-BITS
+    .quad -1                       // CORE (flag)
+    .quad 0                        // CORE-EXT (false for now)
+    .quad 0                        // FLOORED (false — we use symmetric /)
+    .quad 255                      // MAX-CHAR
+    .quad 0x7FFFFFFFFFFFFFFF       // MAX-N
+    .quad 0xFFFFFFFFFFFFFFFF       // MAX-U
+    .quad 256                      // RETURN-STACK-CELLS (2048/8)
+    .quad 512                      // STACK-CELLS (4096/8)
+env_kinds:
+    .byte 1, 1, 0, 0, 0, 1, 1, 1, 1, 1
+    .space 6
+env_n_counted:  .asciz "/COUNTED-STRING"
+env_n_aub:      .asciz "ADDRESS-UNIT-BITS"
+env_n_core:     .asciz "CORE"
+env_n_core_ext: .asciz "CORE-EXT"
+env_n_floored:  .asciz "FLOORED"
+env_n_maxchar:  .asciz "MAX-CHAR"
+env_n_maxn:     .asciz "MAX-N"
+env_n_maxu:     .asciz "MAX-U"
+env_n_rstack:   .asciz "RETURN-STACK-CELLS"
+env_n_stack:    .asciz "STACK-CELLS"
 
 str_hello:  .asciz "PickleForth v0.1\n"
 str_prompt: .asciz "\nok> "
 str_ok:     .asciz " ok\n"
 str_bye:    .asciz "Bye!\n"
 str_quest:  .asciz "? "
+str_undefined:  .ascii "undefined: "
+                .byte 0
+str_underflow:  .asciz "stack underflow\n"
+str_overflow:   .asciz "stack overflow\n"
+str_memfault:   .asciz "memory access error\n"
 str_redef:  .asciz " is redefined\n"
+.align 8
+quit_jmpbuf:        .skip 256      // sigjmp_buf for fault recovery
+fault_handlers_on:  .quad 0
 str_x:      .asciz "X"
 
 // ============================================================================
@@ -4119,6 +4800,9 @@ str_x:      .asciz "X"
 // ============================================================================
 forth_init_str:
     // Order matters: define dependencies before users.
+
+    // HERE as DP @ (shadows CODE HERE so SEE shows the classic definition)
+    .ascii ": HERE DP @ ; "
 
     // --- 1. Simple ANS helpers (no control flow, no >CODE) ---
     .ascii ": BL 32 ; "
@@ -4235,8 +4919,15 @@ forth_init_str:
     .ascii ": DUMP-LINE DUP .HA SPACE SPACE DUP 16 0 DO DUP I + DUMP-END @ U< IF DUP I + C@ .H2 SPACE ELSE SPACE SPACE SPACE THEN LOOP SPACE SPACE 16 0 DO DUP I + DUMP-END @ U< IF DUP I + C@ DUP BL 127 WITHIN 0= IF DROP BL THEN EMIT ELSE BL EMIT THEN LOOP DROP 16 + ; "
     .ascii ": DUMP BASE @ >R HEX OVER + DUMP-END ! BEGIN DUP DUMP-END @ U< WHILE CR DUMP-LINE REPEAT DROP CR R> BASE ! ; "
     // DEPTH — high-level so SEE shows TOS-cached layout (stack grows down):
-    //   SP@ first (sample DSP before more pushes), SP0 = empty DSP, cells = diff/8.
+    //   SP@ first (sample DSP before more pushes), SP0 = empty DSP, cells = diff/CELL.
     .ascii ": DEPTH SP@ SP0 SWAP - CELL / ; "
+    // */MOD */  — double intermediate via M* then symmetric divide (matches ARM /)
+    .ascii ": */MOD >R M* R> SM/REM ; "
+    .ascii ": */ */MOD SWAP DROP ; "
+    // ABORT / ABORT" — high-level; QUIT is pure CODE (XQUIT -> _do_quit).
+    // ABORT: SP0 SP! clears data stack (TOS-cache model), then QUIT.
+    .ascii ": ABORT SP0 SP! QUIT ; "
+    .ascii ": ABORT\" STATE @ IF POSTPONE S\" POSTPONE TYPE POSTPONE ABORT ELSE 34 PARSE TYPE ABORT THEN ; IMMEDIATE "
     // FORGET <name>  remove name and all newer words; rewind HERE to name's header.
     // FIND leaves (c-addr 0|xt flag); 0= IF consumes flag — do not DROP xt after THEN.
     // Refuses names below USER-DICT (static kernel). HERE rewound via negative ALLOT.
@@ -4688,8 +5379,16 @@ dict_lbrack:  // [ ( -- ) immediate, switch to interpret
     .space 7
 
 .align 8
-dict_here:  // HERE ( -- addr )
+dict_dp:  // DP ( -- a-addr )  dictionary pointer variable
     .quad dict_lbrack
+    .quad 2
+    .quad XDP
+    .asciz "DP"
+    .space 6
+
+.align 8
+dict_here:  // HERE ( -- addr )  also redefined high-level as DP @
+    .quad dict_dp
     .quad 4
     .quad XHERE
     .asciz "HERE"
@@ -5163,8 +5862,16 @@ dict_spfetch:  // SP@ ( -- addr )  current DSP
     .space 5
 
 .align 8
-dict_spaces:  // SPACES ( n -- )
+dict_spstore:  // SP! ( addr -- )  set DSP; clear TOS cache
     .quad dict_spfetch
+    .quad 3
+    .quad XSPSTORE
+    .asciz "SP!"
+    .space 5
+
+.align 8
+dict_spaces:  // SPACES ( n -- )
+    .quad dict_spstore
     .quad 6
     .quad XSPACES
     .asciz "SPACES"
@@ -5217,6 +5924,94 @@ dict_twostore:  // 2! ( x1 x2 a-addr -- )
     .quad XTWOSTORE
     .asciz "2!"
     .space 6
+
+.align 8
+dict_umstar:  // UM* ( u1 u2 -- ud )
+    .quad dict_twostore
+    .quad 3
+    .quad XUMSTAR
+    .asciz "UM*"
+    .space 5
+
+.align 8
+dict_mstar:  // M* ( n1 n2 -- d )
+    .quad dict_umstar
+    .quad 2
+    .quad XMSTAR
+    .asciz "M*"
+    .space 6
+
+.align 8
+dict_ummod:  // UM/MOD ( ud u1 -- u2 u3 )
+    .quad dict_mstar
+    .quad 6
+    .quad XUMMOD
+    .asciz "UM/MOD"
+    .space 2
+
+.align 8
+dict_smrem:  // SM/REM ( d1 n1 -- n2 n3 )
+    .quad dict_ummod
+    .quad 6
+    .quad XSMREM
+    .asciz "SM/REM"
+    .space 2
+
+.align 8
+dict_fmmod:  // FM/MOD ( d1 n1 -- n2 n3 )
+    .quad dict_smrem
+    .quad 6
+    .quad XFMMOD
+    .asciz "FM/MOD"
+    .space 2
+
+.align 8
+dict_quit:  // QUIT ( -- )  CODE outer interpreter
+    .quad dict_fmmod
+    .quad 4
+    .quad XQUIT
+    .asciz "QUIT"
+    .space 4
+
+.align 8
+dict_source_id:  // SOURCE-ID ( -- n )
+    .quad dict_quit
+    .quad 9
+    .quad XSOURCE_ID
+    .asciz "SOURCE-ID"
+    .space 7
+
+.align 8
+dict_refill:  // REFILL ( -- flag )
+    .quad dict_source_id
+    .quad 6
+    .quad XREFILL
+    .asciz "REFILL"
+    .space 2
+
+.align 8
+dict_accept:  // ACCEPT ( c-addr +n1 -- +n2 )
+    .quad dict_refill
+    .quad 6
+    .quad XACCEPT
+    .asciz "ACCEPT"
+    .space 2
+
+.align 8
+dict_to_number:  // >NUMBER ( ud1 c-addr1 u1 -- ud2 c-addr2 u2 )
+    .quad dict_accept
+    .quad 7
+    .quad XTONUMBER
+    .asciz ">NUMBER"
+    .space 1
+
+.align 8
+dict_environment_q:  // ENVIRONMENT? ( c-addr u -- false | i*x true )
+    .quad dict_to_number
+    .quad 12
+    .quad XENVIRONMENT_Q
+    .asciz "ENVIRONMENT?"
+    .space 4
 
 // ============================================================================
 // User dictionary space (grows upward)
