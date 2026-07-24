@@ -3193,18 +3193,21 @@ forth_init_str:
     .ascii ": ELSE BRANCH-ADDR , HERE 0 , SWAP HERE OVER - SWAP ! ; IMMEDIATE "
     .ascii ": WHILE 0BRANCH-ADDR , HERE 0 , ; IMMEDIATE "
     .ascii ": REPEAT BRANCH-ADDR , SWAP HERE - , HERE OVER - SWAP ! ; IMMEDIATE "
+    // ?COMP ( -- )  error if not compiling (ANS throw -14)
+    .ascii ": ?COMP STATE @ 0= IF S\" compile only\" TYPE CR -14 THROW THEN ; "
+
     // DO/LOOP: ( limit start -- ) ... LOOP    classic Forth order: limit first
-    .ascii ": DO ['] (DO) , HERE ; IMMEDIATE "
-    .ascii ": LOOP ['] (LOOP) , HERE - , ; IMMEDIATE "
-    .ascii ": +LOOP ['] (+LOOP) , HERE - , ; IMMEDIATE "
+    .ascii ": DO ?COMP ['] (DO) , HERE ; IMMEDIATE "
+    .ascii ": LOOP ?COMP ['] (LOOP) , HERE - , ; IMMEDIATE "
+    .ascii ": +LOOP ?COMP ['] (+LOOP) , HERE - , ; IMMEDIATE "
 
     // --- 4. Defining words / parse helpers using the above ---
     .ascii ": CHAR BL WORD COUNT DROP C@ ; "
-    .ascii ": [CHAR] CHAR LIT-ADDR , , ; IMMEDIATE "
+    .ascii ": [CHAR] ?COMP CHAR LIT-ADDR , , ; IMMEDIATE "
     .ascii ": VARIABLE CREATE 0 , ; "
     // CONSTANT via DOES> (body+0=does_ip, body+8=value; DOES> action @ )
     .ascii ": CONSTANT CREATE , DOES> @ ; "
-    .ascii ": RECURSE LATEST @ , ; IMMEDIATE "
+    .ascii ": RECURSE ?COMP LATEST @ , ; IMMEDIATE "
 
     // --- 4b. Pictured numeric output (single-cell); . and U. stay native (BASE-aware) ---
     .ascii "VARIABLE HLD "
@@ -3229,13 +3232,13 @@ forth_init_str:
     //   immediate:     compile xt (runs when outer word runs)
     //   non-immediate: compile LIT xt (COMP,)  so runtime compiles xt via ,
     .ascii ": (COMP,) , ; "
-    .ascii ": POSTPONE STATE @ 0= IF EXIT THEN BL WORD FIND DUP 0= IF 2DROP EXIT THEN 1 = IF , ELSE LIT-ADDR , , ['] (COMP,) , THEN ; IMMEDIATE "
+    .ascii ": POSTPONE ?COMP BL WORD FIND DUP 0= IF 2DROP EXIT THEN 1 = IF , ELSE LIT-ADDR , , ['] (COMP,) , THEN ; IMMEDIATE "
 
     // CASE OF ENDOF ENDCASE (ANS-style; compilation only)
-    .ascii ": CASE 0 ; IMMEDIATE "
-    .ascii ": OF 1+ >R POSTPONE OVER POSTPONE = POSTPONE IF POSTPONE DROP R> ; IMMEDIATE "
-    .ascii ": ENDOF >R POSTPONE ELSE R> ; IMMEDIATE "
-    .ascii ": ENDCASE POSTPONE DROP BEGIN DUP WHILE 1- >R POSTPONE THEN R> REPEAT DROP ; IMMEDIATE "
+    .ascii ": CASE ?COMP 0 ; IMMEDIATE "
+    .ascii ": OF ?COMP 1+ >R POSTPONE OVER POSTPONE = POSTPONE IF POSTPONE DROP R> ; IMMEDIATE "
+    .ascii ": ENDOF ?COMP >R POSTPONE ELSE R> ; IMMEDIATE "
+    .ascii ": ENDCASE ?COMP POSTPONE DROP BEGIN DUP WHILE 1- >R POSTPONE THEN R> REPEAT DROP ; IMMEDIATE "
 
     // --- 5. Tools / extensions ---
     .ascii ": WORDS LATEST @ BEGIN DUP WHILE DUP NAME>STRING TYPE SPACE @ REPEAT DROP CR ; "
