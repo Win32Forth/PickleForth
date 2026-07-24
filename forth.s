@@ -59,7 +59,7 @@
 //   >CODE >NAME >FLAGS >LINK NAME>STRING DOCOL? DOCON-ADDR — extensions
 //   LIT BRANCH 0BRANCH + *-ADDR plumbing — internal
 //   LATEST STATE BASE — address-pushing (BASE is ANS-like variable)
-//   INCLUDE FLOAD ALIAS SEE WORDS .S — extensions / file-ish
+//   INCLUDE FLOAD ALIAS SEE WORDS .S ELAPSED .ELAPSED MS@ UNUSED .FREE — extensions / file-ish
 //   CELL     — push 8; not an ANS word (CELL+ / CELLS are ANS)
 //
 // Still missing major ANS Core pieces:
@@ -165,8 +165,8 @@ _main:
     mov  x20, #0
 
     // Initialize latest_var to newest static word
-    adrp x0, dict_catch_ok@page
-    add  x0, x0, dict_catch_ok@pageoff
+    adrp x0, dict_unused@page
+    add  x0, x0, dict_unused@pageoff
     str  x0, [x24]
 
     // HERE = user_dict_area
@@ -694,6 +694,18 @@ _patch_dict:
     nop
     PATCH_CODE dict_catch_ok, XCATCH_OK
     nop
+    PATCH_LINK dict_contains, dict_catch_ok
+    nop
+    PATCH_CODE dict_contains, XCONTAINS
+    nop
+    PATCH_LINK dict_msfetch, dict_contains
+    nop
+    PATCH_CODE dict_msfetch, XMSFETCH
+    nop
+    PATCH_LINK dict_unused, dict_msfetch
+    nop
+    PATCH_CODE dict_unused, XUNUSED
+    nop
 
     .purgem PATCH_CODE
     .purgem PATCH_LINK
@@ -1126,23 +1138,16 @@ _tick_fail:
     svc #0x80
     b _do_quit
 
-// EXECUTE ( xt -- ) execute a dictionary entry
+// EXECUTE ( xt -- ) execute a dictionary entry and return to caller.
+// Must NOT force the interpret trampoline: when EXECUTE is used inside a
+// colon definition (e.g. ELAPSED), IP already points at the next cell and
+// DOCOL/NEXT/EXIT nest correctly. Interpret-time EXECUTE still returns via
+// the existing restart_cell IP set up by _exec_found.
 XEXECUTE:
-    mov x0, x20
-    ldr x20, [x22], #8
-    // Set up trampoline so NEXT after the word returns to interpreter
-    adrp x19, dict_restart@page
-    add  x19, x19, dict_restart@pageoff
-    adrp x1, XRESTART@page
-    add  x1, x1, XRESTART@pageoff
-    str  x1, [x19, #16]
-    adrp x1, restart_cell@page
-    add  x1, x1, restart_cell@pageoff
-    str  x19, [x1]
-    mov  x19, x1
-    mov  x21, x0
-    ldr  x1, [x0, #16]  // load code field (native code pointer)
-    br   x1
+    mov x21, x20                   // W = xt (dict entry)
+    ldr x20, [x22], #8             // pop xt → prior TOS
+    ldr x1, [x21, #16]             // code field
+    br x1
 
 // LITERAL ( x -- ) immediate: compile LIT + value
 XLITERAL:
@@ -1661,6 +1666,96 @@ XPAD:
     adrp x0, pad_buffer@page
     add x0, x0, pad_buffer@pageoff
     mov x20, x0
+    NEXT
+
+// MS@ ( -- u )  wall-clock milliseconds since Unix epoch
+// Uses libc gettimeofday (stable on Darwin); not ANS MS (which is a delay).
+XMSFETCH:
+    SAVE_VM
+    sub sp, sp, #16                // struct timeval { tv_sec, tv_usec }
+    mov x0, sp
+    mov x1, xzr
+    bl _gettimeofday
+    ldr x0, [sp]                   // tv_sec
+    ldr x1, [sp, #8]               // tv_usec
+    add sp, sp, #16
+    RESTORE_VM
+    mov x2, #1000
+    mul x0, x0, x2                 // sec * 1000
+    udiv x1, x1, x2                // usec / 1000
+    add x0, x0, x1
+    str x20, [x22, #-8]!
+    mov x20, x0
+    NEXT
+
+// UNUSED ( -- u )  free bytes remaining in user_dict_area (16384 total)
+XUNUSED:
+    adrp x0, here_ptr@page
+    add x0, x0, here_ptr@pageoff
+    ldr x1, [x0]                   // HERE
+    adrp x0, user_dict_area@page
+    add x0, x0, user_dict_area@pageoff
+    add x0, x0, #16384             // end of user dictionary
+    subs x0, x0, x1                // free = end - HERE
+    b.hs 1f
+    mov x0, xzr                    // clamp if overrun
+1:
+    str x20, [x22, #-8]!
+    mov x20, x0
+    NEXT
+
+// CONTAINS ( hay-a hay-u ned-a ned-u -- flag )
+// True if needle appears in haystack (ASCII case-insensitive).
+// Empty needle => true.
+// Stack: x20=ned-u, [DSP]=ned-a, [DSP+8]=hay-u, [DSP+16]=hay-a
+XCONTAINS:
+    mov x4, x20                    // ned-u
+    ldr x3, [x22], #8              // ned-a
+    ldr x2, [x22], #8              // hay-u
+    ldr x1, [x22], #8              // hay-a
+    // now [x22] = previous TOS; x20 still stale
+    cbz x4, _cont_yes
+    cmp x2, x4
+    b.lo _cont_no
+    sub x5, x2, x4
+    add x5, x5, #1                 // positions to try
+    mov x6, #0                     // i
+_cont_i:
+    cmp x6, x5
+    b.hs _cont_no
+    mov x7, #0                     // j
+_cont_j:
+    cmp x7, x4
+    b.hs _cont_yes
+    add x8, x1, x6
+    add x8, x8, x7
+    ldrb w9, [x8]
+    ldrb w10, [x3, x7]
+    cmp w9, #'a'
+    b.lo 1f
+    cmp w9, #'z'
+    b.hi 1f
+    sub w9, w9, #32
+1:
+    cmp w10, #'a'
+    b.lo 2f
+    cmp w10, #'z'
+    b.hi 2f
+    sub w10, w10, #32
+2:
+    cmp w9, w10
+    b.ne _cont_next_i
+    add x7, x7, #1
+    b _cont_j
+_cont_next_i:
+    add x6, x6, #1
+    b _cont_i
+_cont_yes:
+    // prior TOS already at [x22]; replace ned-u with flag
+    mov x20, #-1
+    NEXT
+_cont_no:
+    mov x20, #0
     NEXT
 
 // EVALUATE ( c-addr u -- )  nest SOURCE and interpret the string
@@ -3241,11 +3336,23 @@ forth_init_str:
     .ascii ": ENDCASE ?COMP POSTPONE DROP BEGIN DUP WHILE 1- >R POSTPONE THEN R> REPEAT DROP ; IMMEDIATE "
 
     // --- 5. Tools / extensions ---
-    .ascii ": WORDS LATEST @ BEGIN DUP WHILE DUP NAME>STRING TYPE SPACE @ REPEAT DROP CR ; "
+    // WORDS [string]  list all names, or only those containing string (case-insensitive).
+    // Keep filter (fa fu) under the walk: >R / 2DUP / R@ NAME>STRING / 2SWAP so CONTAINS
+    // does not consume the filter (previous ROT >R 2SWAP path ate fa fu on first match check).
+    .ascii ": WORDS BL WORD COUNT LATEST @ BEGIN DUP WHILE >R 2DUP R@ NAME>STRING 2SWAP CONTAINS IF R@ NAME>STRING TYPE SPACE THEN R> @ REPEAT DROP 2DROP CR ; "
     .ascii ": DOCOL? >CODE @ ['] WORDS >CODE @ = ; "
     .ascii ": SEE ' DUP DOCOL? IF 58 EMIT SPACE ELSE 67 EMIT 79 EMIT 68 EMIT 69 EMIT SPACE THEN DUP NAME>STRING TYPE SPACE DUP DOCOL? 0= IF DROP 40 EMIT 112 EMIT 114 EMIT 105 EMIT 109 EMIT 105 EMIT 116 EMIT 105 EMIT 118 EMIT 101 EMIT 41 EMIT CR EXIT THEN >BODY BEGIN DUP @ DUP EXIT-ADDR = IF 2DROP 59 EMIT CR EXIT THEN DUP LIT-ADDR = IF DROP 8 + DUP @ . 8 + ELSE DUP NAME>STRING TYPE SPACE DUP BRANCH-ADDR = OVER 0BRANCH-ADDR = OR IF DROP 8 + DUP @ . SPACE 8 + ELSE DROP 8 + THEN THEN AGAIN ; "
     .ascii ": ALIAS CREATE LATEST @ >CODE SWAP >CODE @ SWAP ! ; "
     .ascii "' INCLUDE ALIAS FLOAD "
+    // .FREE ( -- )  print free user-dictionary bytes (UNUSED is the cell value)
+    .ascii ": .FREE UNUSED U. SPACE S\" bytes free\" TYPE CR ; "
+    // Digit helpers for .ELAPSED (zero-padded; BASE forced to DECIMAL)
+    .ascii ": .2DIG 10 /MOD 48 + EMIT 48 + EMIT ; "
+    .ascii ": .3DIG 100 /MOD 48 + EMIT .2DIG ; "
+    // .ELAPSED ( ms -- )  print milliseconds as HH:MM:SS.mmm (HH at least 2 digits)
+    .ascii ": .ELAPSED BASE @ >R DECIMAL 1000 /MOD SWAP >R 60 /MOD SWAP >R 60 /MOD SWAP >R DUP 10 < IF 48 EMIT THEN <# #S #> TYPE 58 EMIT R> .2DIG 58 EMIT R> .2DIG 46 EMIT R> .3DIG R> BASE ! ; "
+    // ELAPSED <name>  run name once; print wall time as HH:MM:SS.mmm
+    .ascii ": ELAPSED ' >R MS@ R@ EXECUTE MS@ SWAP - .ELAPSED CR R> DROP ; "
 
     .byte 0  // null terminator
 
@@ -4107,6 +4214,30 @@ dict_catch_ok:  // (CATCH-OK) internal
     .quad XCATCH_OK
     .asciz "(CATCH-OK)"
     .space 6
+
+.align 8
+dict_contains:  // CONTAINS ( hay-a hay-u ned-a ned-u -- flag )
+    .quad dict_catch_ok
+    .quad 8
+    .quad XCONTAINS
+    .asciz "CONTAINS"
+    .space 8
+
+.align 8
+dict_msfetch:  // MS@ ( -- u ) milliseconds (wall clock)
+    .quad dict_contains
+    .quad 3
+    .quad XMSFETCH
+    .asciz "MS@"
+    .space 5
+
+.align 8
+dict_unused:  // UNUSED ( -- u ) free user dictionary bytes
+    .quad dict_msfetch
+    .quad 6
+    .quad XUNUSED
+    .asciz "UNUSED"
+    .space 2
 
 // ============================================================================
 // User dictionary space (grows upward)
