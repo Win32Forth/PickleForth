@@ -44,9 +44,12 @@
 //   Logic: AND OR XOR INVERT
 //   Compare: = <> < > U< 0= 0< 0<> 0> >= <= WITHIN  TRUE FALSE
 //   Memory: @ ! C@ C! +! FILL ERASE  CELL+ CELLS CHAR+ CHARS ALIGN ALIGNED
+//           2@ 2! C,
 //   Parse:  WORD PARSE  CHAR [CHAR]  BL
 //   Comments: \  (
-//   I/O: EMIT KEY CR TYPE SPACE . U.
+//   I/O: EMIT KEY CR TYPE SPACE SPACES . U.
+//   Stack probe: SP0 SP@ ; DEPTH is high-level (SEE-able)
+//   Double-ish: S>D 2* 2/
 //   Numeric input honors BASE; DECIMAL HEX
 //   Compile: : ; CREATE VARIABLE CONSTANT , ALLOT HERE [ ] IMMEDIATE
 //            LITERAL ' ['] EXECUTE RECURSE
@@ -59,16 +62,21 @@
 //   >CODE >NAME >FLAGS >LINK NAME>STRING DOCOL? DOCON-ADDR — extensions
 //   LIT BRANCH 0BRANCH + *-ADDR plumbing — internal
 //   LATEST STATE BASE — address-pushing (BASE is ANS-like variable)
-//   INCLUDE FLOAD ALIAS SEE WORDS .S ELAPSED .ELAPSED MS@ UNUSED .FREE — extensions / file-ish
+//   INCLUDE FLOAD ALIAS SEE WORDS .S ELAPSED .ELAPSED MS@ UNUSED .FREE
+//   DUMP FORGET ANEW USER-DICT REDEF-WARNING — extensions / file-ish
 //   CELL     — push 8; not an ANS word (CELL+ / CELLS are ANS)
 //
 // Still missing major ANS Core pieces:
-//   REFILL  C"  VALUE TO  >NUMBER  ENVIRONMENT?
+//   ABORT ABORT" QUIT  >NUMBER ACCEPT ENVIRONMENT?
+//   UM* UM/MOD M* SM/REM FM/MOD */ */MOD
+//   REFILL C" VALUE TO  (and more Core Ext)
 //
 // Batch-1: S" ."  ANS FIND  SOURCE  >IN
 // Batch-2: DO LOOP +LOOP I J LEAVE UNLOOP  DOES>  pictured numeric
 // Batch-3: POSTPONE  MOVE CMOVE CMOVE>  CASE OF ENDOF ENDCASE
 //          EVALUATE (nested SOURCE)  CATCH THROW
+// Batch-4: SPACES C, S>D 2* 2/ 2@ 2!  (CODE); DEPTH is high-level via SP0/SP@
+// Next Core priority: double-cell math (UM* UM/MOD M* SM/REM FM/MOD */ */MOD)
 //   Note: DO/LOOP are compilation words (use inside : defs). CREATE body is
 //   does_ip at +0, user PFA at +8 (DOVAR/DODOES/DOCON aware).
 //   EVALUATE nests SOURCE via a stack (also used by INCLUDE/FLOAD).
@@ -165,8 +173,8 @@ _main:
     mov  x20, #0
 
     // Initialize latest_var to newest static word
-    adrp x0, dict_unused@page
-    add  x0, x0, dict_unused@pageoff
+    adrp x0, dict_twostore@page
+    add  x0, x0, dict_twostore@pageoff
     str  x0, [x24]
 
     // HERE = user_dict_area
@@ -706,6 +714,51 @@ _patch_dict:
     nop
     PATCH_CODE dict_unused, XUNUSED
     nop
+    PATCH_LINK dict_redef_warning, dict_unused
+    nop
+    PATCH_CODE dict_redef_warning, XREDEF_WARNING
+    nop
+    PATCH_LINK dict_user_dict, dict_redef_warning
+    nop
+    PATCH_CODE dict_user_dict, XUSER_DICT
+    nop
+    // SP0/SP@ for high-level DEPTH; SPACES C, S>D 2* 2/ 2@ 2!
+    PATCH_LINK dict_sp0, dict_user_dict
+    nop
+    PATCH_CODE dict_sp0, XSP0
+    nop
+    PATCH_LINK dict_spfetch, dict_sp0
+    nop
+    PATCH_CODE dict_spfetch, XSPFETCH
+    nop
+    PATCH_LINK dict_spaces, dict_spfetch
+    nop
+    PATCH_CODE dict_spaces, XSPACES
+    nop
+    PATCH_LINK dict_ccomma, dict_spaces
+    nop
+    PATCH_CODE dict_ccomma, XCCOMMA
+    nop
+    PATCH_LINK dict_stod, dict_ccomma
+    nop
+    PATCH_CODE dict_stod, XSTOD
+    nop
+    PATCH_LINK dict_twostar, dict_stod
+    nop
+    PATCH_CODE dict_twostar, XTWOSTAR
+    nop
+    PATCH_LINK dict_twoslash, dict_twostar
+    nop
+    PATCH_CODE dict_twoslash, XTWOSLASH
+    nop
+    PATCH_LINK dict_twofetch, dict_twoslash
+    nop
+    PATCH_CODE dict_twofetch, XTWOFETCH
+    nop
+    PATCH_LINK dict_twostore, dict_twofetch
+    nop
+    PATCH_CODE dict_twostore, XTWOSTORE
+    nop
 
     .purgem PATCH_CODE
     .purgem PATCH_LINK
@@ -1183,6 +1236,10 @@ XCOLON:
     // x0 = word addr, x1 = word len
     mov x19, x0          // save word addr
     mov x20, x1          // save word len
+    // Warn if this name already exists in the dictionary
+    mov x0, x19
+    mov x1, x20
+    bl _warn_redef
 
     // Get current HERE = new entry address
     adrp x0, here_ptr@page
@@ -1278,6 +1335,10 @@ XCREATE:
     cbz x1, _create_fail
     mov x19, x0
     mov x20, x1
+    // Warn if this name already exists
+    mov x0, x19
+    mov x1, x20
+    bl _warn_redef
     // Get current HERE = new entry address
     adrp x0, here_ptr@page
     add x0, x0, here_ptr@pageoff
@@ -1688,20 +1749,125 @@ XMSFETCH:
     mov x20, x0
     NEXT
 
-// UNUSED ( -- u )  free bytes remaining in user_dict_area (16384 total)
+// UNUSED ( -- u )  free bytes remaining in user_dict_area (128 KiB)
+.equ USER_DICT_SIZE, 131072
 XUNUSED:
     adrp x0, here_ptr@page
     add x0, x0, here_ptr@pageoff
     ldr x1, [x0]                   // HERE
     adrp x0, user_dict_area@page
     add x0, x0, user_dict_area@pageoff
-    add x0, x0, #16384             // end of user dictionary
+    mov x2, #USER_DICT_SIZE
+    add x0, x0, x2                 // end of user dictionary
     subs x0, x0, x1                // free = end - HERE
     b.hs 1f
     mov x0, xzr                    // clamp if overrun
 1:
     str x20, [x22, #-8]!
     mov x20, x0
+    NEXT
+
+// REDEF-WARNING ( -- addr )  VARIABLE-like; non-zero = warn on redefine
+// Defaults to 0 at cold start; set TRUE (-1) when entering the user REPL.
+XREDEF_WARNING:
+    str x20, [x22, #-8]!
+    adrp x0, redef_warn@page
+    add x0, x0, redef_warn@pageoff
+    mov x20, x0
+    NEXT
+
+// USER-DICT ( -- addr )  start of growable user dictionary (FORGET fence)
+XUSER_DICT:
+    str x20, [x22, #-8]!
+    adrp x0, user_dict_area@page
+    add x0, x0, user_dict_area@pageoff
+    mov x20, x0
+    NEXT
+
+// ============================================================================
+// Stack pointer probes (for high-level DEPTH) + SPACES C, S>D 2* 2/ 2@ 2!
+// ============================================================================
+// Data stack grows down. Empty DSP = data_stack + 4096 (SP0).
+// TOS is kept in x20; SP@ is DSP (x22). Depth cells = (SP0 - SP@) / 8.
+
+// SP0 ( -- addr )  DSP value when the data stack is empty
+XSP0:
+    str x20, [x22, #-8]!
+    adrp x0, data_stack@page
+    add x0, x0, data_stack@pageoff
+    add x0, x0, #4096
+    mov x20, x0
+    NEXT
+
+// SP@ ( -- addr )  current data-stack pointer (under-TOS cells)
+// Capture DSP before pushing the result (push would lower x22 by one cell).
+XSPFETCH:
+    mov x0, x22
+    str x20, [x22, #-8]!
+    mov x20, x0
+    NEXT
+
+// SPACES ( n -- )  emit n spaces (n<=0: no-op)
+XSPACES:
+    mov x1, x20
+    ldr x20, [x22], #8
+    cmp x1, #0
+    b.le _spaces_done
+_spaces_loop:
+    stp x1, x20, [sp, #-16]!
+    str x22, [sp, #-16]!
+    mov x0, #32
+    bl _putchar
+    ldr x22, [sp], #16
+    ldp x1, x20, [sp], #16
+    subs x1, x1, #1
+    b.ne _spaces_loop
+_spaces_done:
+    NEXT
+
+// C, ( char -- )  store char at HERE, advance HERE by 1
+XCCOMMA:
+    mov w0, w20
+    ldr x20, [x22], #8
+    adrp x1, here_ptr@page
+    add x1, x1, here_ptr@pageoff
+    ldr x2, [x1]
+    strb w0, [x2], #1
+    str x2, [x1]
+    NEXT
+
+// S>D ( n -- d )  sign-extend single to double; hi cell is TOS
+XSTOD:
+    str x20, [x22, #-8]!           // lo = n under
+    asr x20, x20, #63              // hi = 0 or -1
+    NEXT
+
+// 2* ( x1 -- x2 )  x2 = x1 shifted left 1 (×2)
+XTWOSTAR:
+    lsl x20, x20, #1
+    NEXT
+
+// 2/ ( x1 -- x2 )  arithmetic shift right 1
+XTWOSLASH:
+    asr x20, x20, #1
+    NEXT
+
+// 2@ ( a-addr -- x1 x2 )  x1 at a-addr (lo), x2 at a-addr+cell (hi/TOS)
+XTWOFETCH:
+    mov x0, x20
+    ldr x1, [x0]                   // lo
+    ldr x20, [x0, #8]              // hi
+    str x1, [x22, #-8]!
+    NEXT
+
+// 2! ( x1 x2 a-addr -- )  store x1 at a-addr, x2 at a-addr+cell
+XTWOSTORE:
+    mov x0, x20                    // a-addr
+    ldr x2, [x22], #8              // x2 (more significant)
+    ldr x1, [x22], #8              // x1 (less significant)
+    ldr x20, [x22], #8
+    str x1, [x0]
+    str x2, [x0, #8]
     NEXT
 
 // CONTAINS ( hay-a hay-u ned-a ned-u -- flag )
@@ -2357,6 +2523,23 @@ _do_quit:
     str  xzr, [x0]
 
 _quit_loop:
+    // Once after bootstrap: REDEF-WARNING ON, and clear data stack (init
+    // may leave residual cells). Do not clear on later prompts — stack persists.
+    adrp x0, redef_boot_done@page
+    add x0, x0, redef_boot_done@pageoff
+    ldr x1, [x0]
+    cbnz x1, 1f
+    mov x1, #1
+    str x1, [x0]
+    adrp x0, redef_warn@page
+    add x0, x0, redef_warn@pageoff
+    mov x1, #-1
+    str x1, [x0]
+    adrp x22, data_stack@page
+    add x22, x22, data_stack@pageoff
+    add x22, x22, #4096
+    mov x20, #0
+1:
     // Print prompt via raw SVC
     mov x0, #1
     adrp x1, str_prompt@page
@@ -3622,6 +3805,41 @@ _fw_fail:
     ldp x29, x30, [sp], #16
     ret
 
+// _warn_redef: x0=name addr, x1=len
+// If name is already in the dictionary, print:  <name> is redefined\n
+// Gated by REDEF-WARNING (redef_warn cell): 0 = quiet, nonzero = warn.
+// Cell is 0 during bootstrap; set to TRUE (-1) when entering QUIT.
+_warn_redef:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    stp x19, x20, [sp, #-16]!
+    adrp x2, redef_warn@page
+    add x2, x2, redef_warn@pageoff
+    ldr x2, [x2]
+    cbz x2, _wr_done
+    mov x19, x0                     // name
+    mov x20, x1                     // len
+    bl _find_word
+    cbz x0, _wr_done
+    // write name
+    cbz x20, 1f
+    mov x0, #1                      // stdout
+    mov x1, x19
+    mov x2, x20
+    mov x16, #4                     // write
+    svc #0x80
+1:
+    mov x0, #1
+    adrp x1, str_redef@page
+    add x1, x1, str_redef@pageoff
+    mov x2, #15                     // " is redefined\n"
+    mov x16, #4
+    svc #0x80
+_wr_done:
+    ldp x19, x20, [sp], #16
+    ldp x29, x30, [sp], #16
+    ret
+
 // _compile_cell: x0 = value, compile at HERE
 _compile_cell:
     adrp x1, here_ptr@page
@@ -3845,6 +4063,8 @@ word_scratch:   .skip 64
 tty_termios_save: .skip 80
 tty_termios_raw:  .skip 80
 tty_raw_active:   .quad 0
+redef_warn:       .quad 0           // REDEF-WARNING body; 0=off, nonzero=on (TRUE after boot)
+redef_boot_done:  .quad 0           // set after first QUIT so default TRUE applied once
 // Line history (see HIST_MAX / HIST_LINE)
 hist_data:        .skip HIST_MAX * HIST_LINE
 hist_draft:       .skip HIST_LINE
@@ -3873,6 +4093,7 @@ str_prompt: .asciz "\nok> "
 str_ok:     .asciz " ok\n"
 str_bye:    .asciz "Bye!\n"
 str_quest:  .asciz "? "
+str_redef:  .asciz " is redefined\n"
 str_x:      .asciz "X"
 
 // ============================================================================
@@ -3992,7 +4213,9 @@ forth_init_str:
     // does not consume the filter (previous ROT >R 2SWAP path ate fa fu on first match check).
     .ascii ": WORDS BL WORD COUNT LATEST @ BEGIN DUP WHILE >R 2DUP R@ NAME>STRING 2SWAP CONTAINS IF R@ NAME>STRING TYPE SPACE THEN R> @ REPEAT DROP 2DROP CR ; "
     .ascii ": DOCOL? >CODE @ ['] WORDS >CODE @ = ; "
-    .ascii ": SEE ' DUP DOCOL? IF 58 EMIT SPACE ELSE 67 EMIT 79 EMIT 68 EMIT 69 EMIT SPACE THEN DUP NAME>STRING TYPE SPACE DUP DOCOL? 0= IF DROP 40 EMIT 112 EMIT 114 EMIT 105 EMIT 109 EMIT 105 EMIT 116 EMIT 105 EMIT 118 EMIT 101 EMIT 41 EMIT CR EXIT THEN >BODY BEGIN DUP @ DUP EXIT-ADDR = IF 2DROP 59 EMIT CR EXIT THEN DUP LIT-ADDR = IF DROP 8 + DUP @ . 8 + ELSE DUP NAME>STRING TYPE SPACE DUP BRANCH-ADDR = OVER 0BRANCH-ADDR = OR IF DROP 8 + DUP @ . SPACE 8 + ELSE DROP 8 + THEN THEN AGAIN ; "
+    // SEE: walk colon body; skip inline data after LIT, (S"), BRANCH, 0BRANCH,
+    // (LOOP), and (+LOOP). Ordinary xts (including (DO), (DOES>), EXIT) are 1 cell.
+    .ascii ": SEE ' DUP DOCOL? IF 58 EMIT SPACE ELSE 67 EMIT 79 EMIT 68 EMIT 69 EMIT SPACE THEN DUP NAME>STRING TYPE SPACE DUP DOCOL? 0= IF DROP 40 EMIT 112 EMIT 114 EMIT 105 EMIT 109 EMIT 105 EMIT 116 EMIT 105 EMIT 118 EMIT 101 EMIT 41 EMIT CR EXIT THEN >BODY BEGIN DUP @ DUP EXIT-ADDR = IF 2DROP 59 EMIT CR EXIT THEN DUP LIT-ADDR = IF DROP 8 + DUP @ . 8 + ELSE DUP ['] (S\") = IF DROP 8 + DUP @ >R 8 + 83 EMIT 34 EMIT SPACE DUP R@ TYPE 34 EMIT SPACE R> + ALIGNED ELSE DUP NAME>STRING TYPE SPACE DUP BRANCH-ADDR = OVER 0BRANCH-ADDR = OR OVER ['] (LOOP) = OR OVER ['] (+LOOP) = OR IF DROP 8 + DUP @ . SPACE 8 + ELSE DROP 8 + THEN THEN THEN AGAIN ; "
     .ascii ": ALIAS CREATE LATEST @ >CODE SWAP >CODE @ SWAP ! ; "
     .ascii "' INCLUDE ALIAS FLOAD "
     // .FREE ( -- )  print free user-dictionary bytes (UNUSED is the cell value)
@@ -4004,6 +4227,23 @@ forth_init_str:
     .ascii ": .ELAPSED BASE @ >R DECIMAL 1000 /MOD SWAP >R 60 /MOD SWAP >R 60 /MOD SWAP >R DUP 10 < IF 48 EMIT THEN <# #S #> TYPE 58 EMIT R> .2DIG 58 EMIT R> .2DIG 46 EMIT R> .3DIG R> BASE ! ; "
     // ELAPSED <name>  run name once; print wall time as HH:MM:SS.mmm
     .ascii ": ELAPSED ' >R MS@ R@ EXECUTE MS@ SWAP - .ELAPSED CR R> DROP ; "
+    // DUMP ( addr u -- )  classic hex+ASCII dump, 16 bytes/line
+    // .H2 byte as 2 hex digits; .HA address as 16 hex digits (BASE=HEX)
+    .ascii ": .H2 255 AND <# # # #> TYPE ; "
+    .ascii ": .HA <# # # # # # # # # # # # # # # # # #> TYPE ; "
+    .ascii "VARIABLE DUMP-END "
+    .ascii ": DUMP-LINE DUP .HA SPACE SPACE DUP 16 0 DO DUP I + DUMP-END @ U< IF DUP I + C@ .H2 SPACE ELSE SPACE SPACE SPACE THEN LOOP SPACE SPACE 16 0 DO DUP I + DUMP-END @ U< IF DUP I + C@ DUP BL 127 WITHIN 0= IF DROP BL THEN EMIT ELSE BL EMIT THEN LOOP DROP 16 + ; "
+    .ascii ": DUMP BASE @ >R HEX OVER + DUMP-END ! BEGIN DUP DUMP-END @ U< WHILE CR DUMP-LINE REPEAT DROP CR R> BASE ! ; "
+    // DEPTH — high-level so SEE shows TOS-cached layout (stack grows down):
+    //   SP@ first (sample DSP before more pushes), SP0 = empty DSP, cells = diff/8.
+    .ascii ": DEPTH SP@ SP0 SWAP - CELL / ; "
+    // FORGET <name>  remove name and all newer words; rewind HERE to name's header.
+    // FIND leaves (c-addr 0|xt flag); 0= IF consumes flag — do not DROP xt after THEN.
+    // Refuses names below USER-DICT (static kernel). HERE rewound via negative ALLOT.
+    .ascii ": FORGET BL WORD FIND 0= IF DROP 63 EMIT CR EXIT THEN DUP USER-DICT U< IF DROP S\" protected\" TYPE CR EXIT THEN DUP @ LATEST ! DUP HERE - ALLOT DROP ; "
+    // ANEW <name>  marker for reloadable modules (classic FPC/Win32Forth style).
+    // First time: CREATE name. Later: EXECUTE name (DOES> FORGETs itself) then re-CREATE.
+    .ascii ": ANEW >IN @ >R BL WORD FIND IF EXECUTE ELSE DROP THEN R> >IN ! CREATE LATEST @ , DOES> @ DUP @ LATEST ! DUP HERE - ALLOT DROP ; "
 
     .byte 0  // null terminator
 
@@ -4890,8 +5130,97 @@ dict_unused:  // UNUSED ( -- u ) free user dictionary bytes
     .asciz "UNUSED"
     .space 2
 
+.align 8
+dict_redef_warning:  // REDEF-WARNING ( -- addr )  warn on redefine when nonzero
+    .quad dict_unused
+    .quad 13
+    .quad XREDEF_WARNING
+    .asciz "REDEF-WARNING"
+    .space 3
+
+.align 8
+dict_user_dict:  // USER-DICT ( -- addr )  base of user dictionary
+    .quad dict_redef_warning
+    .quad 9
+    .quad XUSER_DICT
+    .asciz "USER-DICT"
+    .space 7
+
+.align 8
+dict_sp0:  // SP0 ( -- addr )  empty data-stack DSP
+    .quad dict_user_dict
+    .quad 3
+    .quad XSP0
+    .asciz "SP0"
+    .space 5
+
+.align 8
+dict_spfetch:  // SP@ ( -- addr )  current DSP
+    .quad dict_sp0
+    .quad 3
+    .quad XSPFETCH
+    .asciz "SP@"
+    .space 5
+
+.align 8
+dict_spaces:  // SPACES ( n -- )
+    .quad dict_spfetch
+    .quad 6
+    .quad XSPACES
+    .asciz "SPACES"
+    .space 2
+
+.align 8
+dict_ccomma:  // C, ( char -- )
+    .quad dict_spaces
+    .quad 2
+    .quad XCCOMMA
+    .asciz "C,"
+    .space 6
+
+.align 8
+dict_stod:  // S>D ( n -- d )
+    .quad dict_ccomma
+    .quad 3
+    .quad XSTOD
+    .asciz "S>D"
+    .space 5
+
+.align 8
+dict_twostar:  // 2* ( x1 -- x2 )
+    .quad dict_stod
+    .quad 2
+    .quad XTWOSTAR
+    .asciz "2*"
+    .space 6
+
+.align 8
+dict_twoslash:  // 2/ ( x1 -- x2 )
+    .quad dict_twostar
+    .quad 2
+    .quad XTWOSLASH
+    .asciz "2/"
+    .space 6
+
+.align 8
+dict_twofetch:  // 2@ ( a-addr -- x1 x2 )
+    .quad dict_twoslash
+    .quad 2
+    .quad XTWOFETCH
+    .asciz "2@"
+    .space 6
+
+.align 8
+dict_twostore:  // 2! ( x1 x2 a-addr -- )
+    .quad dict_twofetch
+    .quad 2
+    .quad XTWOSTORE
+    .asciz "2!"
+    .space 6
+
 // ============================================================================
 // User dictionary space (grows upward)
+// Size = USER_DICT_SIZE (128 KiB); keep in sync with XUNUSED
 // ============================================================================
 .align 8
-user_dict_area: .skip 16384
+user_dict_area: .skip USER_DICT_SIZE
