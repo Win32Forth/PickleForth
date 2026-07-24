@@ -2365,10 +2365,10 @@ _quit_loop:
     mov x16, #4
     svc #0x80
 
-    // Read line
+    // Read line (line editor; maxlen leaves room for NUL)
     adrp x0, input_buffer@page
     add  x0, x0, input_buffer@pageoff
-    mov  x1, #255
+    mov  x1, #1023
     bl   _read_line
     cbz  x0, _quit_exit
 
@@ -2678,6 +2678,19 @@ _putchar:
     ldp x29, x30, [sp], #16
     ret
 
+// _rl_echo: like _putchar but only when line-editor owns the TTY (raw mode).
+// Avoids double-echo when still in cooked mode or when stdin is a pipe.
+_rl_echo:
+    stp x29, x30, [sp, #-16]!
+    adrp x1, tty_raw_active@page
+    add x1, x1, tty_raw_active@pageoff
+    ldr x1, [x1]
+    cbz x1, 1f
+    bl _putchar
+1:
+    ldp x29, x30, [sp], #16
+    ret
+
 // _getchar: returns char or -1 on EOF
 // Uses only x0-x2/x16 (+ frame). Does not touch x19-x28 (VM-safe).
 .globl _getchar
@@ -2721,51 +2734,679 @@ _pss_done:
     ldp x29, x30, [sp], #16
     ret
 
-// _read_line: x0=buf, x1=maxlen -> x0=buf ptr on success, 0 on EOF
-// Must preserve all VM regs (x19-x24). Previous bug: x21 (W) was clobbered.
-_read_line:
+// ============================================================================
+// Line editor (_read_line)
+// Raw-ish TTY (no ICANON/ECHO) + local echo, so left/right/backspace work
+// when pasting or editing a long definition before Enter.
+// Up/Down arrows walk a ring of recent lines (history).
+// x0=buf, x1=maxlen (incl. room for NUL) -> x0=buf or 0 on EOF
+// Preserves VM regs x19-x24 (and more).
+// ============================================================================
+
+// History: 32 lines x 512 bytes (NUL-terminated). Ring buffer.
+.equ HIST_MAX, 32
+.equ HIST_LINE, 512
+
+// _tty_raw_enter / _tty_raw_leave: libc tcgetattr/tcsetattr
+// termios layout (Darwin arm64): c_lflag @24, c_cc @32, VMIN=16, VTIME=17
+// ICANON=0x100, ECHO=0x8, ECHOE=0x2
+_tty_raw_enter:
     stp x29, x30, [sp, #-16]!
     mov x29, sp
+    adrp x1, tty_termios_save@page
+    add x1, x1, tty_termios_save@pageoff
+    mov x0, #0                      // stdin
+    bl _tcgetattr
+    cbnz x0, _tty_re_fail
+    // copy save -> raw (72 bytes)
+    adrp x0, tty_termios_save@page
+    add x0, x0, tty_termios_save@pageoff
+    adrp x1, tty_termios_raw@page
+    add x1, x1, tty_termios_raw@pageoff
+    mov x2, #72
+1:
+    cbz x2, 2f
+    ldrb w3, [x0], #1
+    strb w3, [x1], #1
+    sub x2, x2, #1
+    b 1b
+2:
+    adrp x1, tty_termios_raw@page
+    add x1, x1, tty_termios_raw@pageoff
+    ldr x0, [x1, #24]               // c_lflag
+    mov x2, #0x108                  // ICANON|ECHO
+    bic x0, x0, x2
+    mov x2, #0x2                    // ECHOE
+    bic x0, x0, x2
+    str x0, [x1, #24]
+    mov w0, #1
+    strb w0, [x1, #32+16]           // c_cc[VMIN]=1
+    strb wzr, [x1, #32+17]          // c_cc[VTIME]=0
+    mov x0, #0
+    mov x2, x1
+    mov x1, #0                      // TCSANOW
+    bl _tcsetattr
+    cbnz x0, _tty_re_fail
+    adrp x0, tty_raw_active@page
+    add x0, x0, tty_raw_active@pageoff
+    mov x1, #1
+    str x1, [x0]
+    ldp x29, x30, [sp], #16
+    ret
+_tty_re_fail:
+    adrp x0, tty_raw_active@page
+    add x0, x0, tty_raw_active@pageoff
+    str xzr, [x0]
+    ldp x29, x30, [sp], #16
+    ret
+
+_tty_raw_leave:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    adrp x0, tty_raw_active@page
+    add x0, x0, tty_raw_active@pageoff
+    ldr x1, [x0]
+    cbz x1, 1f
+    str xzr, [x0]
+    mov x0, #0
+    mov x1, #0                      // TCSANOW
+    adrp x2, tty_termios_save@page
+    add x2, x2, tty_termios_save@pageoff
+    bl _tcsetattr
+1:
+    ldp x29, x30, [sp], #16
+    ret
+
+// _rl_emit_bs: emit n backspaces (x0=n)
+_rl_emit_bs:
+    stp x29, x30, [sp, #-16]!
     stp x19, x20, [sp, #-16]!
-    stp x21, x22, [sp, #-16]!   // x21 is VM W — must save
-    mov x19, x0                 // buf
-    mov x20, x1                 // maxlen
-    mov x21, #0                 // index
-_rl_loop:
-    cmp x21, x20
-    b.ge _rl_done
-    bl _getchar
-    cmp w0, #-1
-    b.le _rl_eof
-    cmp w0, #10
-    b.eq _rl_nl
-    strb w0, [x19, x21]
-    add x21, x21, #1
-    b _rl_loop
-_rl_nl:
-    strb wzr, [x19, x21]        // null terminate
-    mov x0, x19
+    mov x19, x0
+1:
+    cbz x19, 2f
+    mov x0, #8
+    bl _rl_echo
+    sub x19, x19, #1
+    b 1b
+2:
+    ldp x19, x20, [sp], #16
+    ldp x29, x30, [sp], #16
+    ret
+
+// _rl_redraw_tail: from cursor pos to end, then pad space, then back up.
+// x19=buf x21=len x22=pos  (does not clobber those permanently beyond needs)
+// After delete/insert-at-middle: show buf[pos..len), space, BS*(len-pos+1)
+_rl_redraw_tail:
+    stp x29, x30, [sp, #-16]!
+    stp x23, x24, [sp, #-16]!
+    mov x23, x22                    // i = pos
+1:
+    cmp x23, x21
+    b.ge 2f
+    ldrb w0, [x19, x23]
+    bl _rl_echo
+    add x23, x23, #1
+    b 1b
+2:
+    mov x0, #32                     // trailing space clears leftover char
+    bl _rl_echo
+    // backspaces: (len - pos + 1)
+    sub x0, x21, x22
+    add x0, x0, #1
+    bl _rl_emit_bs
+    ldp x23, x24, [sp], #16
+    ldp x29, x30, [sp], #16
+    ret
+
+// _rl_clear_display: erase current line on screen (cursor -> col0, wipe)
+// uses x19/x21/x22
+_rl_clear_display:
+    stp x29, x30, [sp, #-16]!
+    stp x23, x24, [sp, #-16]!
+    mov x0, x22
+    bl _rl_emit_bs                  // cursor to start
+    mov x23, x21
+1:
+    cbz x23, 2f
+    mov x0, #32
+    bl _rl_echo
+    sub x23, x23, #1
+    b 1b
+2:
+    mov x0, x21
+    bl _rl_emit_bs
+    ldp x23, x24, [sp], #16
+    ldp x29, x30, [sp], #16
+    ret
+
+// _rl_load_str: replace edit buffer with C-string at x0 (NUL-term), redraw
+// respects maxlen in x20; updates x21/x22
+_rl_load_str:
+    stp x29, x30, [sp, #-16]!
+    stp x23, x24, [sp, #-16]!
+    stp x25, x26, [sp, #-16]!
+    mov x25, x0                     // src
+    bl _rl_clear_display
+    mov x21, #0
+    mov x23, #0
+1:
+    ldrb w0, [x25, x23]
+    cbz w0, 2f
+    cmp x23, x20
+    b.ge 2f
+    strb w0, [x19, x23]
+    add x23, x23, #1
+    b 1b
+2:
+    mov x21, x23
+    mov x22, x23
+    strb wzr, [x19, x21]
+    // echo new line
+    mov x23, #0
+3:
+    cmp x23, x21
+    b.ge 4f
+    ldrb w0, [x19, x23]
+    bl _rl_echo
+    add x23, x23, #1
+    b 3b
+4:
+    ldp x25, x26, [sp], #16
+    ldp x23, x24, [sp], #16
+    ldp x29, x30, [sp], #16
+    ret
+
+// _hist_push: save current line (x19, x21=len) into history ring
+_hist_push:
+    stp x29, x30, [sp, #-16]!
+    stp x19, x20, [sp, #-16]!
+    stp x21, x22, [sp, #-16]!
+    stp x23, x24, [sp, #-16]!
+    cbz x21, _hp_done               // skip empty
+    // cap copy length
+    mov x22, x21
+    cmp x22, #HIST_LINE-1
+    b.ls 1f
+    mov x22, #HIST_LINE-1
+1:
+    // skip if identical to most recent entry
+    adrp x0, hist_count@page
+    add x0, x0, hist_count@pageoff
+    ldr x1, [x0]
+    cbz x1, _hp_store
+    adrp x0, hist_head@page
+    add x0, x0, hist_head@pageoff
+    ldr x2, [x0]                    // head = next write
+    // newest slot = (head - 1) mod HIST_MAX
+    subs x2, x2, #1
+    b.ge 2f
+    mov x2, #HIST_MAX-1
+2:
+    // compare
+    mov x3, #HIST_LINE
+    mul x3, x2, x3
+    adrp x4, hist_data@page
+    add x4, x4, hist_data@pageoff
+    add x4, x4, x3                  // &hist[newest]
+    mov x5, #0
+3:
+    cmp x5, x22
+    b.ge 4f
+    ldrb w6, [x19, x5]
+    ldrb w7, [x4, x5]
+    cmp w6, w7
+    b.ne _hp_store
+    add x5, x5, #1
+    b 3b
+4:
+    ldrb w7, [x4, x5]               // must be NUL at end for equal
+    cbnz w7, _hp_store
+    // equal — skip push
+    b _hp_done
+_hp_store:
+    adrp x0, hist_head@page
+    add x0, x0, hist_head@pageoff
+    ldr x2, [x0]
+    mov x3, #HIST_LINE
+    mul x3, x2, x3
+    adrp x4, hist_data@page
+    add x4, x4, hist_data@pageoff
+    add x4, x4, x3
+    mov x5, #0
+5:
+    cmp x5, x22
+    b.ge 6f
+    ldrb w6, [x19, x5]
+    strb w6, [x4, x5]
+    add x5, x5, #1
+    b 5b
+6:
+    strb wzr, [x4, x5]
+    // head = (head+1) % HIST_MAX
+    add x2, x2, #1
+    cmp x2, #HIST_MAX
+    b.lo 7f
+    mov x2, #0
+7:
+    str x2, [x0]
+    adrp x0, hist_count@page
+    add x0, x0, hist_count@pageoff
+    ldr x1, [x0]
+    cmp x1, #HIST_MAX
+    b.hs _hp_done
+    add x1, x1, #1
+    str x1, [x0]
+_hp_done:
+    adrp x0, hist_nav@page
+    add x0, x0, hist_nav@pageoff
+    mov x1, #-1
+    str x1, [x0]
+    ldp x23, x24, [sp], #16
     ldp x21, x22, [sp], #16
     ldp x19, x20, [sp], #16
     ldp x29, x30, [sp], #16
     ret
-_rl_eof:
-    cbz x21, _rl_null
+
+// _rl_hist_up: older line (ESC [ A)
+_rl_hist_up:
+    stp x29, x30, [sp, #-16]!
+    adrp x0, hist_count@page
+    add x0, x0, hist_count@pageoff
+    ldr x1, [x0]
+    cbz x1, _hu_done
+    adrp x0, hist_nav@page
+    add x0, x0, hist_nav@pageoff
+    ldr x2, [x0]                    // current nav (-1 = draft)
+    // first up: save draft
+    cmp x2, #-1
+    b.ne 1f
+    // copy buf -> hist_draft
+    adrp x3, hist_draft@page
+    add x3, x3, hist_draft@pageoff
+    mov x4, #0
+2:
+    cmp x4, x21
+    b.ge 3f
+    cmp x4, #HIST_LINE-1
+    b.ge 3f
+    ldrb w5, [x19, x4]
+    strb w5, [x3, x4]
+    add x4, x4, #1
+    b 2b
+3:
+    strb wzr, [x3, x4]
+    adrp x3, hist_draft_len@page
+    add x3, x3, hist_draft_len@pageoff
+    str x21, [x3]
+    mov x2, #0                      // nav = newest
+    b 4f
+1:
+    // older
+    add x3, x2, #1
+    cmp x3, x1
+    b.hs _hu_done                   // already oldest
+    mov x2, x3
+4:
+    str x2, [x0]
+    // slot = (hist_head - 1 - nav) mod HIST_MAX
+    adrp x3, hist_head@page
+    add x3, x3, hist_head@pageoff
+    ldr x3, [x3]
+    sub x3, x3, #1
+    sub x3, x3, x2
+5:
+    cmp x3, #0
+    b.ge 6f
+    add x3, x3, #HIST_MAX
+    b 5b
+6:
+    mov x4, #HIST_LINE
+    mul x4, x3, x4
+    adrp x0, hist_data@page
+    add x0, x0, hist_data@pageoff
+    add x0, x0, x4
+    bl _rl_load_str
+_hu_done:
+    ldp x29, x30, [sp], #16
+    ret
+
+// _rl_hist_down: newer line / draft (ESC [ B)
+_rl_hist_down:
+    stp x29, x30, [sp, #-16]!
+    adrp x0, hist_nav@page
+    add x0, x0, hist_nav@pageoff
+    ldr x2, [x0]
+    cmp x2, #-1
+    b.eq _hd_done                   // already on draft
+    cbz x2, 1f                      // nav 0 -> restore draft
+    // newer
+    sub x2, x2, #1
+    str x2, [x0]
+    adrp x3, hist_head@page
+    add x3, x3, hist_head@pageoff
+    ldr x3, [x3]
+    sub x3, x3, #1
+    sub x3, x3, x2
+2:
+    cmp x3, #0
+    b.ge 3f
+    add x3, x3, #HIST_MAX
+    b 2b
+3:
+    mov x4, #HIST_LINE
+    mul x4, x3, x4
+    adrp x1, hist_data@page
+    add x1, x1, hist_data@pageoff
+    add x0, x1, x4
+    bl _rl_load_str
+    b _hd_done
+1:
+    mov x1, #-1
+    str x1, [x0]
+    adrp x0, hist_draft@page
+    add x0, x0, hist_draft@pageoff
+    bl _rl_load_str
+_hd_done:
+    ldp x29, x30, [sp], #16
+    ret
+
+// _read_line: x0=buf, x1=maxlen -> x0=buf ptr on success, 0 on EOF
+_read_line:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    stp x19, x20, [sp, #-16]!
+    stp x21, x22, [sp, #-16]!
+    stp x23, x24, [sp, #-16]!
+    stp x25, x26, [sp, #-16]!
+    mov x19, x0                     // buf
+    // leave 1 byte for NUL
+    subs x20, x1, #1
+    b.gt 1f
+    mov x20, #0
+1:
+    mov x21, #0                     // len
+    mov x22, #0                     // pos
+    // reset history navigation for this prompt
+    adrp x0, hist_nav@page
+    add x0, x0, hist_nav@pageoff
+    mov x1, #-1
+    str x1, [x0]
+    bl _tty_raw_enter
+_rl_loop:
+    bl _getchar
+    cmp w0, #-1
+    b.le _rl_eof
+    and w0, w0, #0xff
+    // Enter
+    cmp w0, #10
+    b.eq _rl_nl
+    cmp w0, #13
+    b.eq _rl_nl
+    // Backspace / DEL
+    cmp w0, #8
+    b.eq _rl_backspace
+    cmp w0, #127
+    b.eq _rl_backspace
+    // Ctrl-A home
+    cmp w0, #1
+    b.eq _rl_home
+    // Ctrl-E end
+    cmp w0, #5
+    b.eq _rl_end
+    // Ctrl-U kill whole line
+    cmp w0, #21
+    b.eq _rl_kill_all
+    // Ctrl-K kill to end
+    cmp w0, #11
+    b.eq _rl_kill_eol
+    // Ctrl-D: EOF if empty, else delete forward
+    cmp w0, #4
+    b.eq _rl_ctrl_d
+    // ESC sequences (arrows, etc.)
+    cmp w0, #27
+    b.eq _rl_esc
+    // Printable ASCII
+    cmp w0, #32
+    b.lo _rl_loop
+    cmp w0, #126
+    b.hi _rl_loop
+    // insert w0 at pos
+    cmp x21, x20
+    b.ge _rl_loop                   // full
+    mov w25, w0                     // save char
+    // shift right: from len-1 down to pos
+    mov x23, x21
+_rl_ins_shift:
+    cmp x23, x22
+    b.le _rl_ins_store
+    sub x24, x23, #1
+    ldrb w0, [x19, x24]
+    strb w0, [x19, x23]
+    sub x23, x23, #1
+    b _rl_ins_shift
+_rl_ins_store:
+    strb w25, [x19, x22]
+    add x21, x21, #1
+    // echo inserted char + tail
+    mov w0, w25
+    bl _rl_echo
+    add x22, x22, #1
+    // print rest of line after new cursor, then BS back
+    mov x23, x22
+_rl_ins_echo:
+    cmp x23, x21
+    b.ge _rl_ins_back
+    ldrb w0, [x19, x23]
+    bl _rl_echo
+    add x23, x23, #1
+    b _rl_ins_echo
+_rl_ins_back:
+    sub x0, x21, x22
+    bl _rl_emit_bs
+    b _rl_loop
+
+_rl_backspace:
+    cbz x22, _rl_loop
+    sub x22, x22, #1
+    // shift left from pos
+    mov x23, x22
+_rl_bs_shift:
+    add x24, x23, #1
+    cmp x24, x21
+    b.ge _rl_bs_done_shift
+    ldrb w0, [x19, x24]
+    strb w0, [x19, x23]
+    add x23, x23, #1
+    b _rl_bs_shift
+_rl_bs_done_shift:
+    sub x21, x21, #1
+    mov x0, #8
+    bl _rl_echo
+    bl _rl_redraw_tail
+    b _rl_loop
+
+_rl_home:
+    mov x0, x22
+    bl _rl_emit_bs
+    mov x22, #0
+    b _rl_loop
+
+_rl_end:
+1:
+    cmp x22, x21
+    b.ge _rl_loop
+    ldrb w0, [x19, x22]
+    bl _rl_echo
+    add x22, x22, #1
+    b 1b
+
+_rl_kill_all:
+    mov x0, x22
+    bl _rl_emit_bs
+    // erase visible: spaces for old len, then BS
+    mov x23, x21
+1:
+    cbz x23, 2f
+    mov x0, #32
+    bl _rl_echo
+    sub x23, x23, #1
+    b 1b
+2:
+    mov x0, x21
+    bl _rl_emit_bs
+    mov x21, #0
+    mov x22, #0
+    b _rl_loop
+
+_rl_kill_eol:
+    // clear on screen from pos
+    sub x23, x21, x22
+1:
+    cbz x23, 2f
+    mov x0, #32
+    bl _rl_echo
+    sub x23, x23, #1
+    b 1b
+2:
+    sub x0, x21, x22
+    bl _rl_emit_bs
+    mov x21, x22
+    b _rl_loop
+
+_rl_ctrl_d:
+    cbz x21, _rl_eof                // empty -> EOF
+    // delete forward if not at end
+    cmp x22, x21
+    b.ge _rl_loop
+    mov x23, x22
+_rl_del_shift:
+    add x24, x23, #1
+    cmp x24, x21
+    b.ge _rl_del_done
+    ldrb w0, [x19, x24]
+    strb w0, [x19, x23]
+    add x23, x23, #1
+    b _rl_del_shift
+_rl_del_done:
+    sub x21, x21, #1
+    bl _rl_redraw_tail
+    b _rl_loop
+
+// ESC [ ... final   (CSI).  w26 holds last parameter digit (for ~ keys).
+_rl_esc:
+    bl _getchar
+    cmp w0, #-1
+    b.le _rl_eof
+    cmp w0, #'['
+    b.ne _rl_loop                   // drop lone ESC / Alt- keys
+    mov w26, #0                     // last CSI digit
+    // collect CSI until final byte 0x40-0x7E
+_rl_csi:
+    bl _getchar
+    cmp w0, #-1
+    b.le _rl_eof
+    cmp w0, #'0'
+    b.lo 1f
+    cmp w0, #'9'
+    b.hi 1f
+    mov w26, w0                     // remember digit
+    b _rl_csi
+1:
+    cmp w0, #0x40
+    b.lo _rl_csi                    // other parameter/intermediate
+    // final
+    cmp w0, #'A'                    // up — history older
+    b.eq _rl_up
+    cmp w0, #'B'                    // down — history newer
+    b.eq _rl_down
+    cmp w0, #'C'                    // right
+    b.eq _rl_right
+    cmp w0, #'D'                    // left
+    b.eq _rl_left
+    cmp w0, #'H'                    // home
+    b.eq _rl_home
+    cmp w0, #'F'                    // end
+    b.eq _rl_end
+    cmp w0, #'~'
+    b.ne _rl_loop
+    // ESC [ n ~  : 1/7=home 3=delete 4/8=end
+    cmp w26, #'3'
+    b.eq _rl_ctrl_d
+    cmp w26, #'1'
+    b.eq _rl_home
+    cmp w26, #'7'
+    b.eq _rl_home
+    cmp w26, #'4'
+    b.eq _rl_end
+    cmp w26, #'8'
+    b.eq _rl_end
+    b _rl_loop
+
+_rl_up:
+    bl _rl_hist_up
+    b _rl_loop
+
+_rl_down:
+    bl _rl_hist_down
+    b _rl_loop
+
+_rl_left:
+    cbz x22, _rl_loop
+    sub x22, x22, #1
+    mov x0, #8
+    bl _rl_echo
+    b _rl_loop
+
+_rl_right:
+    cmp x22, x21
+    b.ge _rl_loop
+    ldrb w0, [x19, x22]
+    bl _rl_echo
+    add x22, x22, #1
+    b _rl_loop
+
+_rl_nl:
+    // move visually to end then newline
+1:
+    cmp x22, x21
+    b.ge 2f
+    ldrb w0, [x19, x22]
+    bl _rl_echo
+    add x22, x22, #1
+    b 1b
+2:
+    mov x0, #10
+    bl _rl_echo
     strb wzr, [x19, x21]
+    bl _hist_push                   // remember non-empty lines
+    // _tty_raw_leave clobbers x0 (tcsetattr status); keep buffer ptr in x25
+    mov x25, x19
+    bl _tty_raw_leave
+    mov x0, x25                     // success: return buf (non-zero)
+    ldp x25, x26, [sp], #16
+    ldp x23, x24, [sp], #16
+    ldp x21, x22, [sp], #16
+    ldp x19, x20, [sp], #16
+    ldp x29, x30, [sp], #16
+    ret
+
+_rl_eof:
+    // Preserve len across leave; x0 must be buf or 0 after restore
+    mov x25, x21
+    bl _tty_raw_leave
+    cbz x25, _rl_null
+    strb wzr, [x19, x25]
     mov x0, x19
+    ldp x25, x26, [sp], #16
+    ldp x23, x24, [sp], #16
     ldp x21, x22, [sp], #16
     ldp x19, x20, [sp], #16
     ldp x29, x30, [sp], #16
     ret
 _rl_null:
     mov x0, #0
-    ldp x21, x22, [sp], #16
-    ldp x19, x20, [sp], #16
-    ldp x29, x30, [sp], #16
-    ret
-_rl_done:
-    strb wzr, [x19, x21]
-    mov x0, x19
+    ldp x25, x26, [sp], #16
+    ldp x23, x24, [sp], #16
     ldp x21, x22, [sp], #16
     ldp x19, x20, [sp], #16
     ldp x29, x30, [sp], #16
@@ -3198,9 +3839,19 @@ XRESTART:
 
 data_stack:     .skip 4096
 return_stack:   .skip 2048
-input_buffer:   .skip 256
+input_buffer:   .skip 1024
 file_buffer:    .skip 65536
 word_scratch:   .skip 64
+tty_termios_save: .skip 80
+tty_termios_raw:  .skip 80
+tty_raw_active:   .quad 0
+// Line history (see HIST_MAX / HIST_LINE)
+hist_data:        .skip HIST_MAX * HIST_LINE
+hist_draft:       .skip HIST_LINE
+hist_count:       .quad 0
+hist_head:        .quad 0
+hist_nav:         .quad -1
+hist_draft_len:   .quad 0
 
 state_var:      .quad 0
 base_var:       .quad 10
