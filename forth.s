@@ -1153,10 +1153,23 @@ XIMMEDIATE:
     NEXT
 
 // SETDOC ( c-addr u -- )  pending help for next : / CREATE / :NONAME
+// Skips leading blanks so DOC" text" works with a space after DOC".
 XSETDOC:
     mov x1, x20                    // u
     ldr x0, [x22], #8              // c-addr
     ldr x20, [x22], #8
+1:
+    cbz x1, 2f
+    ldrb w2, [x0]
+    cmp w2, #32
+    b.eq 3f
+    cmp w2, #9
+    b.ne 2f
+3:
+    add x0, x0, #1
+    sub x1, x1, #1
+    b 1b
+2:
     adrp x2, pending_help_addr@page
     add x2, x2, pending_help_addr@pageoff
     str x0, [x2]
@@ -5248,43 +5261,71 @@ str_x:      .asciz "X"
 forth_init_str:
     // Order matters: define dependencies before users.
 
-    // HERE as DP @ (shadows CODE HERE so SEE shows the classic definition)
+    // DOC" needs SETDOC (CODE). Define DOC" first, then document HERE via redefine.
+    .ascii ": DOC\" 34 PARSE SETDOC ; "
+    .ascii "DOC\" HERE ( -- addr ) current dictionary pointer (DP @)\" "
     .ascii ": HERE DP @ ; "
 
-    // --- 1. Simple ANS helpers (BL/SPACE defined after DOC" below) ---
+    // --- 1. Simple ANS helpers ---
+    .ascii "DOC\" CHAR+ ( addr -- addr' ) add size of one char\" "
     .ascii ": CHAR+ 1+ ; "
+    .ascii "DOC\" CHARS ( n -- n ) chars to address units\" "
     .ascii ": CHARS ; "
+    .ascii "DOC\" CELL+ ( addr -- addr' ) add size of one cell\" "
     .ascii ": CELL+ 8 + ; "
+    .ascii "DOC\" CELLS ( n -- n ) cells to address units\" "
     .ascii ": CELLS 8 * ; "
+    .ascii "DOC\" ALIGNED ( addr -- addr' ) next aligned address\" "
     .ascii ": ALIGNED 7 + 7 INVERT AND ; "
+    .ascii "DOC\" ALIGN ( -- ) align DP to cell boundary\" "
     .ascii ": ALIGN HERE ALIGNED HERE - ALLOT ; "
+    .ascii "DOC\" 2DUP ( n1 n2 -- n1 n2 n1 n2 ) duplicate pair\" "
     .ascii ": 2DUP OVER OVER ; "
+    .ascii "DOC\" 2DROP ( n1 n2 -- ) drop two items\" "
     .ascii ": 2DROP DROP DROP ; "
+    .ascii "DOC\" 2SWAP ( n1 n2 n3 n4 -- n3 n4 n1 n2 ) swap pairs\" "
     .ascii ": 2SWAP ROT >R ROT R> ; "
+    .ascii "DOC\" 2OVER ( n1 n2 n3 n4 -- n1 n2 n3 n4 n1 n2 ) copy second pair\" "
     .ascii ": 2OVER >R >R 2DUP R> R> 2SWAP ; "
+    .ascii "DOC\" COUNT ( c-addr -- addr u ) from counted string addr return char-addr and length\" "
     .ascii ": COUNT DUP C@ SWAP CHAR+ SWAP ; "
+    .ascii "DOC\" /STRING ( c-addr u n -- c-addr' u' ) adjust string by n characters\" "
     .ascii ": /STRING DUP >R - SWAP R> + SWAP ; "
+    .ascii "DOC\" DECIMAL ( -- ) set BASE to 10\" "
     .ascii ": DECIMAL 10 BASE ! ; "
+    .ascii "DOC\" HEX ( -- ) set BASE to 16\" "
     .ascii ": HEX 16 BASE ! ; "
+    .ascii "DOC\" 0<> ( x -- flag ) true if not zero\" "
     .ascii ": 0<> 0= 0= ; "
+    .ascii "DOC\" 0> ( n -- flag ) positive?\" "
     .ascii ": 0> 0 > ; "
+    .ascii "DOC\" >= ( n1 n2 -- flag ) greater or equal\" "
     .ascii ": >= < 0= ; "
+    .ascii "DOC\" <= ( n1 n2 -- flag ) less or equal\" "
     .ascii ": <= > 0= ; "
+    .ascii "DOC\" WITHIN ( n lo hi -- f ) within range\" "
     .ascii ": WITHIN OVER - >R - R> U< ; "
 
     // --- 2. Dictionary field accessors (xt = CFA) ---
+    .ascii "DOC\" >LINK ( xt -- a-addr ) link field address\" "
     .ascii ": >LINK 16 - ; "
+    .ascii "DOC\" >FLAGS ( xt -- a-addr ) flags field address\" "
     .ascii ": >FLAGS 8 - ; "
+    .ascii "DOC\" >CODE ( xt -- a-addr ) code field (xt itself)\" "
     .ascii ": >CODE ; "
+    .ascii "DOC\" >BODY ( xt -- addr ) data field of a CREATEd word\" "
     .ascii ": >BODY 8 + ; "
     // Layout: HFA help | NFA name | LFA | FLAGS | CFA | BODY
     // FLAGS: low32 NFA_OFF, bits32-62 HFA_OFF, bit63 IMM
+    .ascii "DOC\" NFA ( xt -- nfa ) name field address\" "
     .ascii ": NFA DUP >FLAGS @ 4294967295 AND - ; "
+    .ascii "DOC\" HFA ( xt -- hfa ) help field address\" "
     .ascii ": HFA DUP >FLAGS @ 32 RSHIFT 2147483647 AND - ; "
+    .ascii "DOC\" NAME>STRING ( nt -- c-addr u ) copy name token name to buffer (valid until next NAME>STRING)\" "
     .ascii ": NAME>STRING NFA COUNT ; "
+    .ascii "DOC\" NAME>HELP ( xt -- c-addr u ) help string\" "
     .ascii ": NAME>HELP HFA COUNT ; "
     // DOC" text" — pending help for next defining word (help should start with name)
-    .ascii ": DOC\" 34 PARSE SETDOC ; "
     // Documented high-level words (DOC" then : … ;)
     .ascii "DOC\" BL ( -- c ) ASCII blank (space)\" "
     .ascii ": BL 32 ; "
@@ -5292,137 +5333,213 @@ forth_init_str:
     .ascii ": SPACE BL EMIT ; "
 
     // --- 3. Control flow (immediate) ---
+    .ascii "DOC\" BEGIN ( -- ) start indefinite loop (immediate)\" "
     .ascii ": BEGIN HERE ; IMMEDIATE "
+    .ascii "DOC\" UNTIL ( flag -- ) loop until true (immediate)\" "
     .ascii ": UNTIL 0BRANCH-ADDR , HERE - , ; IMMEDIATE "
+    .ascii "DOC\" AGAIN ( -- ) unconditional branch back (immediate)\" "
     .ascii ": AGAIN BRANCH-ADDR , HERE - , ; IMMEDIATE "
+    .ascii "DOC\" IF ( flag -- ) conditional (immediate)\" "
     .ascii ": IF 0BRANCH-ADDR , HERE 0 , ; IMMEDIATE "
+    .ascii "DOC\" THEN ( -- ) end of IF/ELSE (immediate)\" "
     .ascii ": THEN HERE OVER - SWAP ! ; IMMEDIATE "
+    .ascii "DOC\" ELSE ( -- ) else part of IF (immediate)\" "
     .ascii ": ELSE BRANCH-ADDR , HERE 0 , SWAP HERE OVER - SWAP ! ; IMMEDIATE "
+    .ascii "DOC\" WHILE ( flag -- ) conditional exit from BEGIN (immediate)\" "
     .ascii ": WHILE 0BRANCH-ADDR , HERE 0 , ; IMMEDIATE "
+    .ascii "DOC\" REPEAT ( -- ) branch back from WHILE (immediate)\" "
     .ascii ": REPEAT BRANCH-ADDR , SWAP HERE - , HERE OVER - SWAP ! ; IMMEDIATE "
     // ?COMP ( -- )  error if not compiling (ANS throw -14)
+    .ascii "DOC\" ?COMP ( -- ) error if not compiling\" "
     .ascii ": ?COMP STATE @ 0= IF S\" compile only\" TYPE CR -14 THROW THEN ; "
 
     // DO/LOOP: ( limit start -- ) ... LOOP    classic Forth order: limit first
     // DO leaves ( 0 dest ); ?DO leaves ( orig dest ) so LOOP/+LOOP can resolve
     // the empty-range forward branch after (?DO).
+    .ascii "DOC\" DO ( limit start -- ) start counted loop\" "
     .ascii ": DO ?COMP ['] (DO) , 0 HERE ; IMMEDIATE "
+    .ascii "DOC\" ?DO ( limit start -- ) start counted loop that skips if start==limit\" "
     .ascii ": ?DO ?COMP ['] (?DO) , HERE 0 , HERE ; IMMEDIATE "
+    .ascii "DOC\" LOOP ( -- ) end DO loop (add 1 to index, branch back if < limit)\" "
     .ascii ": LOOP ?COMP ['] (LOOP) , HERE - , ?DUP IF HERE OVER - SWAP ! THEN ; IMMEDIATE "
+    .ascii "DOC\" +LOOP ( n -- ) end DO loop with custom increment (delta from stack)\" "
     .ascii ": +LOOP ?COMP ['] (+LOOP) , HERE - , ?DUP IF HERE OVER - SWAP ! THEN ; IMMEDIATE "
 
     // --- 4. Defining words / parse helpers using the above ---
+    .ascii "DOC\" CHAR ( name -- xchar ) parse BL-delimited name, return first xchar (UTF-8)\" "
     .ascii ": CHAR BL WORD COUNT DROP C@ ; "
+    .ascii "DOC\" [CHAR] ( name -- ) compile first xchar of name as literal (immediate)\" "
     .ascii ": [CHAR] ?COMP CHAR LIT-ADDR , , ; IMMEDIATE "
+    .ascii "DOC\" VARIABLE ( -- ) name create a variable\" "
     .ascii ": VARIABLE CREATE 0 , ; "
     // CONSTANT via DOES> (body+0=does_ip, body+8=value; DOES> action @ )
+    .ascii "DOC\" CONSTANT ( n -- ) name create a constant\" "
     .ascii ": CONSTANT CREATE , DOES> @ ; "
+    .ascii "DOC\" RECURSE ( -- ) recurse into current definition (immediate)\" "
     .ascii ": RECURSE ?COMP LATEST @ , ; IMMEDIATE "
 
     // --- 4b. Pictured numeric output (single-cell); . and U. stay native (BASE-aware) ---
+    .ascii "DOC\" HLD ( -- addr ) pictured output pointer variable\" "
     .ascii "VARIABLE HLD "
+    .ascii "DOC\" <# ( -- ) begin pictured numeric output\" "
     .ascii ": <# PAD 256 + HLD ! ; "
+    .ascii "DOC\" HOLD ( char -- ) insert char into pictured output\" "
     .ascii ": HOLD -1 HLD +! HLD @ C! ; "
+    .ascii "DOC\" #> ( ud -- c-addr u ) end pictured numeric, return string\" "
     .ascii ": #> DROP HLD @ PAD 256 + OVER - ; "
+    .ascii "DOC\" # ( ud -- ud ) add one digit to pictured output\" "
     .ascii ": # BASE @ /MOD SWAP DUP 9 > IF 7 + THEN 48 + HOLD ; "
+    .ascii "DOC\" #S ( ud -- ud ) add all remaining digits to pictured\" "
     .ascii ": #S BEGIN # DUP 0= UNTIL ; "
+    .ascii "DOC\" SIGN ( n -- ) insert minus sign if n<0 into pictured\" "
     .ascii ": SIGN 0< IF 45 HOLD THEN ; "
     // Formatted print using pictured output (native . / U. remain)
+    .ascii "DOC\" UD. ( ud -- ) print unsigned double\" "
     .ascii ": UD. <# #S #> TYPE SPACE ; "
+    .ascii "DOC\" D. ( d -- ) print signed double in current BASE\" "
     .ascii ": D. DUP 0< IF NEGATE <# #S 45 HOLD #> ELSE <# #S #> THEN TYPE SPACE ; "
     // FILL ( c-addr u char -- ); stack top is u, so bump addr via SWAP 1+ SWAP
+    .ascii "DOC\" FILL ( addr u b -- ) fill u bytes at addr with b\" "
     .ascii ": FILL >R BEGIN DUP WHILE OVER R@ SWAP C! SWAP 1+ SWAP 1- REPEAT R> DROP 2DROP ; "
+    .ascii "DOC\" ERASE ( addr u -- ) fill u bytes at addr with zero\" "
     .ascii ": ERASE 0 FILL ; "
     // MOVE / CMOVE (ANS character/cell move; MOVE handles overlap)
+    .ascii "DOC\" CMOVE ( c-addr1 c-addr2 u -- ) copy u chars from c-addr1 to c-addr2 (low→high)\" "
     .ascii ": CMOVE BEGIN DUP WHILE >R OVER C@ OVER C! CHAR+ SWAP CHAR+ SWAP R> 1- REPEAT DROP 2DROP ; "
+    .ascii "DOC\" CMOVE> ( c-addr1 c-addr2 u -- ) copy u chars from c-addr1 to c-addr2 (high→low)\" "
     .ascii ": CMOVE> DUP >R + 1- SWAP R@ + 1- SWAP R> BEGIN DUP WHILE >R OVER C@ OVER C! 1- SWAP 1- SWAP R> 1- REPEAT DROP 2DROP ; "
+    .ascii "DOC\" MOVE ( addr1 addr2 u -- ) copy u bytes\" "
     .ascii ": MOVE DUP 0= IF DROP 2DROP EXIT THEN >R 2DUP U< IF R> CMOVE> ELSE R> CMOVE THEN ; "
 
     // POSTPONE (ANS, compilation only):
     //   immediate:     compile xt (runs when outer word runs)
     //   non-immediate: compile LIT xt (COMP,)  so runtime compiles xt via ,
+    .ascii "DOC\" (COMP,) ( xt -- ) compile xt (for POSTPONE)\" "
     .ascii ": (COMP,) , ; "
+    .ascii "DOC\" POSTPONE ( -- ) name append compilation semantics of next word (immediate)\" "
     .ascii ": POSTPONE ?COMP BL WORD FIND DUP 0= IF 2DROP EXIT THEN 1 = IF , ELSE LIT-ADDR , , ['] (COMP,) , THEN ; IMMEDIATE "
 
     // CASE OF ENDOF ENDCASE (ANS-style; compilation only)
+    .ascii "DOC\" CASE ( -- ) start CASE structure (immediate)\" "
     .ascii ": CASE ?COMP 0 ; IMMEDIATE "
+    .ascii "DOC\" OF ( x x -- | x ) CASE of branch (immediate)\" "
     .ascii ": OF ?COMP 1+ >R POSTPONE OVER POSTPONE = POSTPONE IF POSTPONE DROP R> ; IMMEDIATE "
+    .ascii "DOC\" ENDOF ( -- ) end of OF, branch to ENDCASE (immediate)\" "
     .ascii ": ENDOF ?COMP >R POSTPONE ELSE R> ; IMMEDIATE "
+    .ascii "DOC\" ENDCASE ( -- ) end CASE, resolve branches (immediate)\" "
     .ascii ": ENDCASE ?COMP POSTPONE DROP BEGIN DUP WHILE 1- >R POSTPONE THEN R> REPEAT DROP ; IMMEDIATE "
 
     // --- 5. Tools / extensions ---
     // WORDS [string]  list all names, or only those containing string (case-insensitive).
     // Keep filter (fa fu) under the walk: >R / 2DUP / R@ NAME>STRING / 2SWAP so CONTAINS
     // does not consume the filter (previous ROT >R 2SWAP path ate fa fu on first match check).
+    .ascii "DOC\" WORDS ( -- ) [name] list words in first search-order wordlist (optional name filter)\" "
     .ascii ": WORDS BL WORD COUNT LATEST @ BEGIN DUP WHILE >R 2DUP R@ NAME>STRING 2SWAP CONTAINS IF R@ NAME>STRING TYPE SPACE THEN R> >LINK @ REPEAT DROP 2DROP CR ; "
+    .ascii "DOC\" DOCOL? ( xt -- flag ) true if colon definition\" "
     .ascii ": DOCOL? @ ['] WORDS @ = ; "
     // SEE: walk colon body; skip inline data after LIT, (S"), BRANCH, 0BRANCH,
     // (LOOP), and (+LOOP). Ordinary xts (including (DO), (DOES>), EXIT) are 1 cell.
     // ALIAS copies CODE field only — correct for CODE words (e.g. FLOAD/INCLUDE)
+    .ascii "DOC\" ALIAS ( xt name -- ) define name with same CODE as xt\" "
     .ascii ": ALIAS CREATE LATEST @ SWAP @ SWAP ! ; "
     // SEE / HELP — one-line header, then body walk.
     // (SEE-BR?) ( xt -- flag ) true if BRANCH / 0BRANCH / (LOOP) / (+LOOP)
+    .ascii "DOC\" (SEE-BR?) ( xt -- flag ) SEE helper: branch/loop xt?\" "
     .ascii ": (SEE-BR?) >R R@ BRANCH-ADDR = R@ 0BRANCH-ADDR = OR R@ ['] (LOOP) = OR R@ ['] (+LOOP) = OR R> DROP ; "
     // Hold each body cell in R so NAME>STRING cannot drop the xt before branch tests.
     // NAME>HELP empty path must leave xt: 2DROP DUP NAME>STRING (not 2DROP NAME>STRING).
+    .ascii "DOC\" SEE ( -- name ) decompile a word\" "
     .ascii ": SEE ' DUP DOCOL? IF 58 EMIT SPACE ELSE 67 EMIT 79 EMIT 68 EMIT 69 EMIT SPACE THEN DUP NAME>HELP DUP IF TYPE ELSE 2DROP DUP NAME>STRING TYPE THEN CR DUP DOCOL? 0= IF DROP 40 EMIT 112 EMIT 114 EMIT 105 EMIT 109 EMIT 105 EMIT 116 EMIT 105 EMIT 118 EMIT 101 EMIT 41 EMIT CR EXIT THEN >BODY BEGIN DUP @ >R R@ EXIT-ADDR = IF R> DROP DROP 59 EMIT CR EXIT THEN R@ LIT-ADDR = IF R> DROP 8 + DUP @ . SPACE 8 + ELSE R@ ['] (S\") = IF R> DROP 8 + DUP @ >R 8 + 83 EMIT 34 EMIT SPACE DUP R@ TYPE 34 EMIT SPACE R> + ALIGNED ELSE R@ (SEE-BR?) IF R@ NAME>STRING TYPE SPACE R> DROP 8 + DUP @ . SPACE 8 + ELSE R@ NAME>STRING TYPE SPACE R> DROP 8 + THEN THEN THEN AGAIN ; "
+    .ascii "DOC\" HELP ( -- ) name show help for a word\" "
     .ascii ": HELP SEE ; "
     .ascii "' INCLUDE ALIAS FLOAD "
     // .FREE ( -- )  print free user-dictionary bytes (UNUSED is the cell value)
+    .ascii "DOC\" .FREE ( -- ) print free dictionary bytes remaining (unsigned, like UNUSED U.)\" "
     .ascii ": .FREE UNUSED U. SPACE S\" bytes free\" TYPE CR ; "
     // Digit helpers for .ELAPSED (zero-padded; BASE forced to DECIMAL)
+    .ascii "DOC\" .2DIG ( n -- ) print n as 2 decimal digits\" "
     .ascii ": .2DIG 10 /MOD 48 + EMIT 48 + EMIT ; "
+    .ascii "DOC\" .3DIG ( n -- ) print n as 3 decimal digits\" "
     .ascii ": .3DIG 100 /MOD 48 + EMIT .2DIG ; "
     // .ELAPSED ( ms -- )  print milliseconds as HH:MM:SS.mmm (HH at least 2 digits)
+    .ascii "DOC\" .ELAPSED ( ms -- ) print ms as HH:MM:SS.mmm\" "
     .ascii ": .ELAPSED BASE @ >R DECIMAL 1000 /MOD SWAP >R 60 /MOD SWAP >R 60 /MOD SWAP >R DUP 10 < IF 48 EMIT THEN <# #S #> TYPE 58 EMIT R> .2DIG 58 EMIT R> .2DIG 46 EMIT R> .3DIG R> BASE ! ; "
     // ELAPSED <name>  run name once; print wall time as HH:MM:SS.mmm
+    .ascii "DOC\" ELAPSED ( name -- ) time execution of name\" "
     .ascii ": ELAPSED ' >R MS@ R@ EXECUTE MS@ SWAP - .ELAPSED CR R> DROP ; "
     // DUMP ( addr u -- )  classic hex+ASCII dump, 16 bytes/line
     // .H2 byte as 2 hex digits; .HA address as 16 hex digits (BASE=HEX)
+    .ascii "DOC\" .H2 ( b -- ) print byte as 2 hex digits\" "
     .ascii ": .H2 255 AND <# # # #> TYPE ; "
+    .ascii "DOC\" .HA ( addr -- ) print address as 16 hex digits\" "
     .ascii ": .HA <# # # # # # # # # # # # # # # # # #> TYPE ; "
+    .ascii "DOC\" DUMP-END ( -- addr ) variable end of DUMP range\" "
     .ascii "VARIABLE DUMP-END "
+    .ascii "DOC\" DUMP-LINE ( addr -- addr' ) dump one line\" "
     .ascii ": DUMP-LINE DUP .HA SPACE SPACE DUP 16 0 DO DUP I + DUMP-END @ U< IF DUP I + C@ .H2 SPACE ELSE SPACE SPACE SPACE THEN LOOP SPACE SPACE 16 0 DO DUP I + DUMP-END @ U< IF DUP I + C@ DUP BL 127 WITHIN 0= IF DROP BL THEN EMIT ELSE BL EMIT THEN LOOP DROP 16 + ; "
+    .ascii "DOC\" DUMP ( addr u -- ) hex dump u bytes from addr (16 per line, ASCII gutter)\" "
     .ascii ": DUMP BASE @ >R HEX OVER + DUMP-END ! BEGIN DUP DUMP-END @ U< WHILE CR DUMP-LINE REPEAT DROP CR R> BASE ! ; "
     // DEPTH — high-level so SEE shows TOS-cached layout (stack grows down)
     .ascii "DOC\" DEPTH ( -- n ) data stack depth in cells\" "
     .ascii ": DEPTH SP@ SP0 SWAP - CELL / ; "
     // */MOD */  — double intermediate via M* then symmetric divide (matches ARM /)
+    .ascii "DOC\" */MOD ( n1 n2 n3 -- rem quot ) multiply then divmod\" "
     .ascii ": */MOD >R M* R> SM/REM ; "
+    .ascii "DOC\" */ ( n1 n2 n3 -- n4 ) multiply to double-cell, divide (quotient)\" "
     .ascii ": */ */MOD SWAP DROP ; "
     // ABORT / ABORT" — high-level; QUIT is pure CODE (XQUIT -> _do_quit).
     // ABORT: SP0 SP! clears data stack (TOS-cache model), then QUIT.
+    .ascii "DOC\" ABORT ( -- ) THROW -1 (catchable; prints Aborted! if uncaught)\" "
     .ascii ": ABORT SP0 SP! QUIT ; "
     .ascii ": ABORT\" STATE @ IF POSTPONE S\" POSTPONE TYPE POSTPONE ABORT ELSE 34 PARSE TYPE ABORT THEN ; IMMEDIATE "
     // FORGET <name>  remove name and all newer words; rewind HERE to name's header.
     // FIND leaves (c-addr 0|xt flag); 0= IF consumes flag — do not DROP xt after THEN.
     // Refuses names below USER-DICT (static kernel). HERE rewound via negative ALLOT.
+    .ascii "DOC\" FORGET ( -- ) name forget name and all later words; prune every wordlist\" "
     .ascii ": FORGET BL WORD FIND 0= IF DROP 63 EMIT CR EXIT THEN DUP USER-DICT U< IF DROP S\" protected\" TYPE CR EXIT THEN DUP >LINK @ LATEST ! DUP HERE - ALLOT DROP ; "
     // ANEW <name>  marker for reloadable modules (classic FPC/Win32Forth style).
+    .ascii "DOC\" ANEW ( name -- ) marker: forget previous then CREATE\" "
     .ascii ": ANEW >IN @ >R BL WORD FIND IF EXECUTE ELSE DROP THEN R> >IN ! CREATE LATEST @ , DOES> @ DUP >LINK @ LATEST ! DUP HERE - ALLOT DROP ; "
     // ON / OFF — store 1 or 0 at addr (classic: FILE-ECHO ON  /  FILE-ECHO OFF)
+    .ascii "DOC\" ON ( addr -- ) store 1 at addr (e.g. file-echo ON)\" "
     .ascii ": ON 1 SWAP ! ; "
+    .ascii "DOC\" OFF ( addr -- ) store 0 at addr (e.g. file-echo OFF)\" "
     .ascii ": OFF 0 SWAP ! ; "
 
     // --- 6. Core Ext (mostly high-level; 2>R/2R>/2R@ are CODE — colon would clobber IP) ---
+    .ascii "DOC\" U> ( u1 u2 -- flag ) unsigned greater\" "
     .ascii ": U> SWAP U< ; "
     // U.R ( u n -- ) right-justify u in a field of n characters (no trailing space)
+    .ascii "DOC\" U.R ( u n -- ) print u right-justified in n field\" "
     .ascii ": U.R >R <# #S #> R> OVER - 0 MAX SPACES TYPE ; "
+    .ascii "DOC\" HOLDS ( c-addr u -- ) add string to pictured numeric output (prepend via HOLD)\" "
     .ascii ": HOLDS BEGIN DUP WHILE 1- 2DUP + C@ HOLD REPEAT 2DROP ; "
+    .ascii "DOC\" COMPILE, ( xt -- ) compile the execution token xt\" "
     .ascii ": COMPILE, , ; "
+    .ascii "DOC\" [COMPILE] ( -- ) name force compile of next word even if immediate (immediate)\" "
     .ascii ": [COMPILE] ?COMP BL WORD FIND 0= IF DROP EXIT THEN DROP , ; IMMEDIATE "
+    .ascii "DOC\" .( ( -- ) print text until ) immediately (immediate)\" "
     .ascii ": .( 41 PARSE TYPE ; IMMEDIATE "
+    .ascii "DOC\" BUFFER: ( u -- ) name create an aligned buffer of u bytes\" "
     .ascii ": BUFFER: CREATE ALLOT ; "
     // VALUE / TO — DOES> body: does_ip at >BODY, value at >BODY CELL+
+    .ascii "DOC\" VALUE ( n -- ) name create a value (mutable constant); set with IS or TO\" "
     .ascii ": VALUE CREATE , DOES> @ ; "
+    .ascii "DOC\" TO ( n -- ) name store n into a VALUE (parsing)\" "
     .ascii ": TO ' >BODY CELL+ STATE @ IF POSTPONE LITERAL POSTPONE ! ELSE ! THEN ; IMMEDIATE "
     // DEFER family — default action ABORT until IS
+    .ascii "DOC\" DEFER ( -- ) name create a deferred word (execution can be changed)\" "
     .ascii ": DEFER CREATE ['] ABORT , DOES> @ EXECUTE ; "
+    .ascii "DOC\" DEFER@ ( xt1 -- xt2 ) get the xt that defer xt1 currently executes\" "
     .ascii ": DEFER@ >BODY CELL+ @ ; "
+    .ascii "DOC\" DEFER! ( xt1 xt2 -- ) set defer xt2 to execute xt1\" "
     .ascii ": DEFER! >BODY CELL+ ! ; "
+    .ascii "DOC\" IS ( xt -- ) name set the xt for a DEFER or the value for a VALUE (parsing)\" "
     .ascii ": IS STATE @ IF POSTPONE ['] POSTPONE DEFER! ELSE ' DEFER! THEN ; IMMEDIATE "
+    .ascii "DOC\" ACTION-OF ( xt1 -- xt2 ) current execution token of a deferred word (like DEFER@)\" "
     .ascii ": ACTION-OF STATE @ IF POSTPONE ['] POSTPONE DEFER@ ELSE ' DEFER@ THEN ; IMMEDIATE "
     // MARKER — executing name restores dictionary to just before MARKER was defined
+    .ascii "DOC\" MARKER ( -- ) name create a restore point for dictionary and search order\" "
     .ascii ": MARKER CREATE LATEST @ , DOES> @ DUP >LINK @ LATEST ! DUP HERE - ALLOT DROP ; "
 
     .byte 0  // null terminator
