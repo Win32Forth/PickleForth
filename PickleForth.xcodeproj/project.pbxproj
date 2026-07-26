@@ -14,6 +14,7 @@
 		A1000002 /* forth.s */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.asm; path = forth.s; sourceTree = "<group>"; };
 		A1000003 /* PickleForth */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = PickleForth; sourceTree = BUILT_PRODUCTS_DIR; };
 		A1000016 /* boot_words.inc */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.asm; path = boot_words.inc; sourceTree = "<group>"; };
+		A1000018 /* colon_words.inc */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.asm; path = colon_words.inc; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -32,6 +33,7 @@
 			children = (
 				A1000002 /* forth.s */,
 				A1000016 /* boot_words.inc */,
+				A1000018 /* colon_words.inc */,
 				A1000006 /* Products */,
 			);
 			sourceTree = "<group>";

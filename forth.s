@@ -19,16 +19,15 @@
 //   assembly helpers that temporarily borrow x19-x24 without saving them.
 //
 // Dictionary header format (built at runtime; grows up with HERE):
-//   NFA:  counted NAME (uppercase), pad to 8 bytes
-//   HFA:  counted COMMENT (stack pic + text), pad to 8 (may be empty)
-//   LFA:  LINK  = previous word's CFA (or 0)           @ CFA-16  >LINK
-//   FFA:  FLAGS = NFA_OFF in low 32 bits, IMM in bit 32 @ CFA-8   >FLAGS
-//   CFA:  CODE  = native code pointer  (** xt from ' / FIND **)  >CODE (= xt)
-//   BODY: parameter / threaded code                     @ CFA+8   >BODY
+//   HFA:  counted HELP (stack pic + text), pad 8 (empty = count 0)
+//   NFA:  counted NAME (uppercase), pad 8
+//   LFA:  LINK  = previous CFA (or 0)     @ CFA-16  >LINK
+//   FFA:  FLAGS @ CFA-8: low32 NFA_OFF, bits32-62 HFA_OFF, bit63 IMM
+//   CFA:  CODE (** xt **)                 >CODE (= xt)
+//   BODY: @ CFA+8                         >BODY
 //
-// LATEST holds the CFA of the newest word.
-// NEXT: W = xt = CFA from *IP; branch to *W.
-// All headers are built by _header_build (boot table + : / CREATE).
+// LATEST = CFA. NEXT: W = CFA from *IP; br *W.
+// _header_build for BOOT_WORD and : / CREATE. SETDOC/DOC" set pending help.
 //
 // ----------------------------------------------------------------------------
 // ANS Forth 2012 compatibility
@@ -285,8 +284,17 @@ _fault_handler:
 // DOCOL / DOEXIT / DOVAR
 // ============================================================================
 // xt = CFA = x21. Body always at CFA+8. CREATE: does_ip @ CFA+8, PFA @ CFA+16.
-.equ FLAG_IMM, 0x100000000          // bit 32 of FLAGS cell
+// Header layout (low → high):
+//   HFA: counted HELP + pad 8
+//   NFA: counted NAME (UC) + pad 8
+//   LFA: LINK (prev CFA)     @ CFA-16
+//   FFA: FLAGS               @ CFA-8
+//   CFA: CODE
+//   BODY                     @ CFA+8
+// FLAGS: bits 0-31 NFA_OFF, bits 32-62 HFA_OFF, bit 63 IMMEDIATE
 .equ NFA_OFF_MASK, 0xFFFFFFFF
+.equ HFA_OFF_MASK, 0x7FFFFFFF
+.equ FLAG_IMM, 0x8000000000000000   // bit 63
 
 .macro DICT_BODY_ADDR dst, cfa
     add \dst, \cfa, #8
@@ -326,9 +334,9 @@ DODOES:
 // ============================================================================
 // _header_build:
 //   x0=name addr, x1=name len, x2=help addr, x3=help len, x4=code addr, x5=imm(0/1)
-//   Builds: NFA name | HFA help | LFA link | FFA flags | CFA code
-//   HERE advanced to CFA+8 (body start). LATEST = CFA. Returns x0 = CFA.
-//   Names stored UPPERCASE. Counted strings, pad each field to 8 bytes.
+//   Builds: HFA help | NFA name | LFA link | FFA flags | CFA code
+//   HERE → CFA+8. LATEST = CFA. Returns x0 = CFA.
+//   Names UPPERCASE. Help always written (empty = count 0 + pad 8).
 // ============================================================================
 .align 4
 _header_build:
@@ -337,14 +345,11 @@ _header_build:
     stp x19, x20, [sp, #-16]!
     stp x21, x22, [sp, #-16]!
     stp x23, x24, [sp, #-16]!
-    // save args
     mov x19, x0                    // name
     mov x20, x1                    // nlen
     mov x21, x2                    // help
     mov x22, x3                    // hlen
     mov x23, x4                    // code
-    // x5 imm kept in x5; x24 is latest ptr — reload after saves
-    // Actually we clobbered x24! Save imm in stack and restore x24 from global
     str x5, [sp, #-16]!            // imm
 
     adrp x24, latest_var@page
@@ -352,33 +357,25 @@ _header_build:
 
     adrp x0, here_ptr@page
     add x0, x0, here_ptr@pageoff
-    ldr x6, [x0]                   // HERE = NFA
-    mov x7, x6                     // keep NFA
+    ldr x6, [x0]                   // HERE
+    mov x8, x6                     // HFA
 
-    // --- counted name (uppercase), pad 8 ---
-    cmp x20, #255
+    // --- counted help first, pad 8 (always at least empty record) ---
+    cmp x22, #255
     b.ls 1f
-    mov x20, #255
+    mov x22, #255
 1:
-    strb w20, [x6], #1
+    strb w22, [x6], #1
     mov x2, #0
 2:
-    cmp x2, x20
+    cmp x2, x22
     b.ge 3f
-    ldrb w3, [x19, x2]
-    // toupper
-    cmp w3, #'a'
-    b.lo 21f
-    cmp w3, #'z'
-    b.hi 21f
-    sub w3, w3, #32
-21:
+    ldrb w3, [x21, x2]
     strb w3, [x6], #1
     add x2, x2, #1
     b 2b
 3:
-    // pad name record to 8
-    sub x2, x6, x7                 // bytes written
+    sub x2, x6, x8
 4:
     tst x2, #7
     b.eq 5f
@@ -386,23 +383,29 @@ _header_build:
     add x2, x2, #1
     b 4b
 5:
-    // --- counted help, pad 8 ---
-    mov x8, x6                     // HFA start (not stored separately)
-    cmp x22, #255
+    // --- counted name (uppercase), pad 8 ---
+    mov x7, x6                     // NFA
+    cmp x20, #255
     b.ls 6f
-    mov x22, #255
+    mov x20, #255
 6:
-    strb w22, [x6], #1
+    strb w20, [x6], #1
     mov x2, #0
 7:
-    cmp x2, x22
+    cmp x2, x20
     b.ge 8f
-    ldrb w3, [x21, x2]
+    ldrb w3, [x19, x2]
+    cmp w3, #'a'
+    b.lo 71f
+    cmp w3, #'z'
+    b.hi 71f
+    sub w3, w3, #32
+71:
     strb w3, [x6], #1
     add x2, x2, #1
     b 7b
 8:
-    sub x2, x6, x8
+    sub x2, x6, x7
 9:
     tst x2, #7
     b.eq 10f
@@ -410,34 +413,52 @@ _header_build:
     add x2, x2, #1
     b 9b
 10:
-    // --- LFA: previous LATEST (CFA) ---
+    // --- LFA ---
     ldr x1, [x24]
     str x1, [x6], #8
     // --- FFA placeholder ---
     str xzr, [x6], #8
-    // --- CFA: code ---
+    // --- CFA ---
     mov x0, x6                     // CFA
     str x23, [x6], #8
-    // FLAGS = NFA_OFF | IMM
-    sub x1, x0, x7                 // NFA_OFF = CFA - NFA
+    // FLAGS = NFA_OFF | (HFA_OFF << 32) | IMM<<63
+    sub x1, x0, x7                 // NFA_OFF
+    sub x2, x0, x8                 // HFA_OFF
+    and x2, x2, #0x7FFFFFFF
+    lsl x2, x2, #32
+    orr x1, x1, x2
     ldr x5, [sp], #16              // imm
     cbz x5, 11f
-    movz x2, #1
-    lsl x2, x2, #32                // FLAG_IMM
+    mov x2, #1
+    lsl x2, x2, #63                // FLAG_IMM
     orr x1, x1, x2
 11:
-    str x1, [x0, #-8]              // store FLAGS at CFA-8
-    // HERE = CFA+8 (body)
+    str x1, [x0, #-8]
     adrp x2, here_ptr@page
     add x2, x2, here_ptr@pageoff
     str x6, [x2]
-    // LATEST = CFA
-    str x0, [x24]
-    // return CFA in x0
+    str x0, [x24]                  // LATEST = CFA
     ldp x23, x24, [sp], #16
     ldp x21, x22, [sp], #16
     ldp x19, x20, [sp], #16
     ldp x29, x30, [sp], #16
+    ret
+
+// _take_pending_help: -> x2=help addr, x3=hlen; clears pending (empty if none)
+_take_pending_help:
+    adrp x0, pending_help_addr@page
+    add x0, x0, pending_help_addr@pageoff
+    ldr x2, [x0]
+    adrp x1, pending_help_len@page
+    add x1, x1, pending_help_len@pageoff
+    ldr x3, [x1]
+    str xzr, [x0]
+    str xzr, [x1]
+    cbnz x2, 1f
+    adrp x2, boot_h_empty@page
+    add x2, x2, boot_h_empty@pageoff
+    mov x3, #0
+1:
     ret
 
 // strlen: x0=zstr -> x0=len
@@ -1065,9 +1086,10 @@ XFIND:
     add x0, x2, #1              // address of name chars
     bl _find_word
     cbz x0, _xfind_not
-    // x0 = CFA, x1 = FLAGS
-    movz x2, #1
-    lsl x2, x2, #32             // FLAG_IMM
+    // x0 = CFA, x1 = FLAGS; IMM = bit 63
+    tst x1, x1                  // set N from MSB? use explicit
+    mov x2, #1
+    lsl x2, x2, #63
     tst x1, x2
     mov x4, #1
     mov x5, #-1
@@ -1124,10 +1146,23 @@ XLITERAL:
 XIMMEDIATE:
     ldr x0, [x24]                  // CFA of latest
     ldr x1, [x0, #-8]              // FLAGS
-    movz x2, #1
-    lsl x2, x2, #32                // FLAG_IMM
+    mov x2, #1
+    lsl x2, x2, #63                // FLAG_IMM bit 63
     orr x1, x1, x2
     str x1, [x0, #-8]
+    NEXT
+
+// SETDOC ( c-addr u -- )  pending help for next : / CREATE / :NONAME
+XSETDOC:
+    mov x1, x20                    // u
+    ldr x0, [x22], #8              // c-addr
+    ldr x20, [x22], #8
+    adrp x2, pending_help_addr@page
+    add x2, x2, pending_help_addr@pageoff
+    str x0, [x2]
+    adrp x2, pending_help_len@page
+    add x2, x2, pending_help_len@pageoff
+    str x1, [x2]
     NEXT
 
 // : ( "name" -- ) start colon definition
@@ -1147,17 +1182,14 @@ XCOLON:
     mov x0, x19
     mov x1, x20
     bl _warn_redef
-    // name x19/x20, empty help, code=DOCOL, imm=0
-    mov x0, x19
+    // name x19/x20, help from pending (or empty), code=DOCOL
+    bl _take_pending_help          // x2/x3 help (clobbers x0/x1)
+    mov x0, x19                    // restore name
     mov x1, x20
-    adrp x2, boot_h_empty@page
-    add x2, x2, boot_h_empty@pageoff
-    mov x3, #0
     adrp x4, DOCOL@page
     add x4, x4, DOCOL@pageoff
     mov x5, #0
-    bl _header_build               // CFA; HERE = body
-    // compile mode
+    bl _header_build
     adrp x0, state_var@page
     add x0, x0, state_var@pageoff
     mov x1, #1
@@ -1183,22 +1215,17 @@ _colon_fail:
 // :NONAME
 // :NONAME ( -- ) start nameless colon definition; ; leaves xt
 XNONAME:
-    // empty name + empty help + DOCOL
+    // empty name + pending/empty help + DOCOL
+    stp x29, x30, [sp, #-16]!
+    bl _take_pending_help          // x2/x3 = help
     adrp x0, boot_h_empty@page
     add x0, x0, boot_h_empty@pageoff
-    mov x1, #0                     // nlen 0 — use empty string
-    // name ptr can be empty cstr
-    mov x0, x0                     // name = ""
-    mov x1, #0
-    mov x2, x0                     // help = ""
-    mov x3, #0
+    mov x1, #0                     // empty name
     adrp x4, DOCOL@page
     add x4, x4, DOCOL@pageoff
     mov x5, #0
-    stp x29, x30, [sp, #-16]!
     bl _header_build
     ldp x29, x30, [sp], #16
-    // remember CFA for ;
     adrp x1, noname_xt@page
     add x1, x1, noname_xt@pageoff
     str x0, [x1]
@@ -1244,11 +1271,9 @@ XCREATE:
     mov x0, x19
     mov x1, x20
     bl _warn_redef
+    bl _take_pending_help          // x2/x3 help (clobbers x0/x1)
     mov x0, x19
     mov x1, x20
-    adrp x2, boot_h_empty@page
-    add x2, x2, boot_h_empty@pageoff
-    mov x3, #0
     adrp x4, DOVAR@page
     add x4, x4, DOVAR@pageoff
     mov x5, #0
@@ -3493,9 +3518,9 @@ _try_find:
     mov x3, x1                     // FLAGS
     ldr x5, [x2]                   // code ptr at CFA
 
-    // Immediate? FLAG_IMM bit 32
-    movz x4, #1
-    lsl x4, x4, #32
+    // Immediate? FLAG_IMM bit 63
+    mov x4, #1
+    lsl x4, x4, #63
     tst x3, x4
     b.ne _exec_found
 
@@ -5226,9 +5251,7 @@ forth_init_str:
     // HERE as DP @ (shadows CODE HERE so SEE shows the classic definition)
     .ascii ": HERE DP @ ; "
 
-    // --- 1. Simple ANS helpers ---
-    .ascii ": BL 32 ; "
-    .ascii ": SPACE BL EMIT ; "
+    // --- 1. Simple ANS helpers (BL/SPACE defined after DOC" below) ---
     .ascii ": CHAR+ 1+ ; "
     .ascii ": CHARS ; "
     .ascii ": CELL+ 8 + ; "
@@ -5254,11 +5277,19 @@ forth_init_str:
     .ascii ": >FLAGS 8 - ; "
     .ascii ": >CODE ; "
     .ascii ": >BODY 8 + ; "
-    // NFA = CFA - (FLAGS & 0xFFFFFFFF); name then help are counted+padded records
+    // Layout: HFA help | NFA name | LFA | FLAGS | CFA | BODY
+    // FLAGS: low32 NFA_OFF, bits32-62 HFA_OFF, bit63 IMM
     .ascii ": NFA DUP >FLAGS @ 4294967295 AND - ; "
+    .ascii ": HFA DUP >FLAGS @ 32 RSHIFT 2147483647 AND - ; "
     .ascii ": NAME>STRING NFA COUNT ; "
-    // NAME>HELP ( xt -- c-addr u )  counted help string after padded name record
-    .ascii ": NAME>HELP NFA DUP C@ CHAR+ ALIGNED + COUNT ; "
+    .ascii ": NAME>HELP HFA COUNT ; "
+    // DOC" text" — pending help for next defining word (help should start with name)
+    .ascii ": DOC\" 34 PARSE SETDOC ; "
+    // Documented high-level words (DOC" then : … ;)
+    .ascii "DOC\" BL ( -- c ) ASCII blank (space)\" "
+    .ascii ": BL 32 ; "
+    .ascii "DOC\" SPACE ( -- ) emit one space\" "
+    .ascii ": SPACE BL EMIT ; "
 
     // --- 3. Control flow (immediate) ---
     .ascii ": BEGIN HERE ; IMMEDIATE "
@@ -5329,8 +5360,8 @@ forth_init_str:
     // (LOOP), and (+LOOP). Ordinary xts (including (DO), (DOES>), EXIT) are 1 cell.
     // ALIAS copies CODE field only — correct for CODE words (e.g. FLOAD/INCLUDE)
     .ascii ": ALIAS CREATE LATEST @ SWAP @ SWAP ! ; "
-    // SEE / HELP — name, help text, then body or (primitive). HELP is a thin colon wrapper.
-    .ascii ": SEE ' DUP DOCOL? IF 58 EMIT SPACE ELSE 67 EMIT 79 EMIT 68 EMIT 69 EMIT SPACE THEN DUP NAME>STRING TYPE CR DUP NAME>HELP DUP IF TYPE CR ELSE 2DROP THEN DUP DOCOL? 0= IF DROP 40 EMIT 112 EMIT 114 EMIT 105 EMIT 109 EMIT 105 EMIT 116 EMIT 105 EMIT 118 EMIT 101 EMIT 41 EMIT CR EXIT THEN >BODY BEGIN DUP @ DUP EXIT-ADDR = IF 2DROP 59 EMIT CR EXIT THEN DUP LIT-ADDR = IF DROP 8 + DUP @ . 8 + ELSE DUP ['] (S\") = IF DROP 8 + DUP @ >R 8 + 83 EMIT 34 EMIT SPACE DUP R@ TYPE 34 EMIT SPACE R> + ALIGNED ELSE DUP NAME>STRING TYPE SPACE DUP BRANCH-ADDR = OVER 0BRANCH-ADDR = OR OVER ['] (LOOP) = OR OVER ['] (+LOOP) = OR IF DROP 8 + DUP @ . SPACE 8 + ELSE DROP 8 + THEN THEN THEN AGAIN ; "
+    // SEE / HELP — one line: "CODE|/colon " + help (includes name) or just name; then body
+    .ascii ": SEE ' DUP DOCOL? IF 58 EMIT SPACE ELSE 67 EMIT 79 EMIT 68 EMIT 69 EMIT SPACE THEN DUP NAME>HELP DUP IF TYPE ELSE 2DROP NAME>STRING TYPE THEN CR DUP DOCOL? 0= IF DROP 40 EMIT 112 EMIT 114 EMIT 105 EMIT 109 EMIT 105 EMIT 116 EMIT 105 EMIT 118 EMIT 101 EMIT 41 EMIT CR EXIT THEN >BODY BEGIN DUP @ DUP EXIT-ADDR = IF 2DROP 59 EMIT CR EXIT THEN DUP LIT-ADDR = IF DROP 8 + DUP @ . 8 + ELSE DUP ['] (S\") = IF DROP 8 + DUP @ >R 8 + 83 EMIT 34 EMIT SPACE DUP R@ TYPE 34 EMIT SPACE R> + ALIGNED ELSE DUP NAME>STRING TYPE SPACE DUP BRANCH-ADDR = OVER 0BRANCH-ADDR = OR OVER ['] (LOOP) = OR OVER ['] (+LOOP) = OR IF DROP 8 + DUP @ . SPACE 8 + ELSE DROP 8 + THEN THEN THEN AGAIN ; "
     .ascii ": HELP SEE ; "
     .ascii "' INCLUDE ALIAS FLOAD "
     // .FREE ( -- )  print free user-dictionary bytes (UNUSED is the cell value)
@@ -5349,8 +5380,8 @@ forth_init_str:
     .ascii "VARIABLE DUMP-END "
     .ascii ": DUMP-LINE DUP .HA SPACE SPACE DUP 16 0 DO DUP I + DUMP-END @ U< IF DUP I + C@ .H2 SPACE ELSE SPACE SPACE SPACE THEN LOOP SPACE SPACE 16 0 DO DUP I + DUMP-END @ U< IF DUP I + C@ DUP BL 127 WITHIN 0= IF DROP BL THEN EMIT ELSE BL EMIT THEN LOOP DROP 16 + ; "
     .ascii ": DUMP BASE @ >R HEX OVER + DUMP-END ! BEGIN DUP DUMP-END @ U< WHILE CR DUMP-LINE REPEAT DROP CR R> BASE ! ; "
-    // DEPTH — high-level so SEE shows TOS-cached layout (stack grows down):
-    //   SP@ first (sample DSP before more pushes), SP0 = empty DSP, cells = diff/CELL.
+    // DEPTH — high-level so SEE shows TOS-cached layout (stack grows down)
+    .ascii "DOC\" DEPTH ( -- n ) data stack depth in cells\" "
     .ascii ": DEPTH SP@ SP0 SWAP - CELL / ; "
     // */MOD */  — double intermediate via M* then symmetric divide (matches ARM /)
     .ascii ": */MOD >R M* R> SM/REM ; "
@@ -5410,6 +5441,10 @@ cfa_branch:     .quad 0
 cfa_0branch:    .quad 0
 cfa_does_rt:    .quad 0
 cfa_catch_ok:   .quad 0
+
+// Pending help for next : / CREATE / :NONAME (SETDOC / DOC")
+pending_help_addr: .quad 0
+pending_help_len:  .quad 0
 
 // Boot catalog (structured records + name strings)
 .include "boot_words.inc"
