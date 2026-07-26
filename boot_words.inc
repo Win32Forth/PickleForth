@@ -6,7 +6,7 @@
 //
 // imm: 0 = normal, 1 = IMMEDIATE
 // CodeLabel: assembly entry point (XDUP, XDROP, DOEXIT, ...)
-// Help strings start empty; fill in a later comment pass.
+// Helps sourced from TZForth primitiveHelpData (+ Pickle-specific notes).
 // ============================================================================
 
 // Dense table row: name*, help*, imm, code*.
@@ -23,150 +23,150 @@
 
 .align 8
 boot_word_table:
-    BOOT_WORD "EXIT", "", 0, DOEXIT
-    BOOT_WORD ";", "", 1, XSEMI
-    BOOT_WORD "LIT", "", 0, XLit
-    BOOT_WORD "DUP", "", 0, XDUP
-    BOOT_WORD "DROP", "", 0, XDROP
-    BOOT_WORD "SWAP", "", 0, XSWAP
-    BOOT_WORD "OVER", "", 0, XOVER
-    BOOT_WORD "ROT", "", 0, XROT
-    BOOT_WORD "NIP", "", 0, XNIP
-    BOOT_WORD "TUCK", "", 0, XTUCK
-    BOOT_WORD "PICK", "", 0, XPICK
-    BOOT_WORD ">R", "", 0, XTOR
-    BOOT_WORD "R>", "", 0, XRTO
-    BOOT_WORD "R@", "", 0, XRFETCH
-    BOOT_WORD "+", "", 0, XPLUS
-    BOOT_WORD "-", "", 0, XMINUS
-    BOOT_WORD "*", "", 0, XSTAR
-    BOOT_WORD "/", "", 0, XSLASH
-    BOOT_WORD "MOD", "", 0, XMOD
-    BOOT_WORD "/MOD", "", 0, XSLMOD
-    BOOT_WORD "=", "", 0, XEQUAL
-    BOOT_WORD "<", "", 0, XLESS
-    BOOT_WORD ">", "", 0, XGREATER
-    BOOT_WORD "U<", "", 0, XULESS
-    BOOT_WORD "AND", "", 0, XAND
-    BOOT_WORD "OR", "", 0, XORR
-    BOOT_WORD "XOR", "", 0, XXOR
-    BOOT_WORD "INVERT", "", 0, XINVERT
-    BOOT_WORD "0=", "", 0, XZEQUAL
-    BOOT_WORD "0<", "", 0, XZLESS
-    BOOT_WORD "TRUE", "", 0, XTRUE
-    BOOT_WORD "FALSE", "", 0, XFALSE
-    BOOT_WORD "1+", "", 0, XONEPLUS
-    BOOT_WORD "1-", "", 0, XONEMINUS
-    BOOT_WORD "CELL", "", 0, XCELL
-    BOOT_WORD "CELLS", "", 0, XCELLS
-    BOOT_WORD "@", "", 0, XFETCH
-    BOOT_WORD "!", "", 0, XSTORE
-    BOOT_WORD "C@", "", 0, XCFETCH
-    BOOT_WORD "C!", "", 0, XCSTORE
-    BOOT_WORD "+!", "", 0, XPLUSSTORE
-    BOOT_WORD "EMIT", "", 0, XEMIT
-    BOOT_WORD "KEY", "", 0, XKEY
-    BOOT_WORD "CR", "", 0, XCR
-    BOOT_WORD ".", "", 0, XDOT
-    BOOT_WORD "U.", "", 0, XUDOT
-    BOOT_WORD ".S", "", 0, XDOTS
-    BOOT_WORD "TYPE", "", 0, XTYPE
-    BOOT_WORD "STATE", "", 0, XSTATE
-    BOOT_WORD "BASE", "", 0, XBASE
-    BOOT_WORD "]", "", 0, XRBRA
-    BOOT_WORD "[", "", 1, XLBRA
-    BOOT_WORD "DP", "", 0, XDP
-    BOOT_WORD "HERE", "", 0, XHERE
-    BOOT_WORD "ALLOT", "", 0, XALLOT
-    BOOT_WORD ",", "", 0, XCOMMA
-    BOOT_WORD "FIND", "", 0, XFIND
-    BOOT_WORD "'", "", 0, XTICK
-    BOOT_WORD "EXECUTE", "", 0, XEXECUTE
-    BOOT_WORD "LITERAL", "", 1, XLITERAL
-    BOOT_WORD "IMMEDIATE", "", 0, XIMMEDIATE
-    BOOT_WORD ":", "", 0, XCOLON
-    BOOT_WORD "CREATE", "", 0, XCREATE
-    BOOT_WORD "0BRANCH", "", 0, X0Branch
-    BOOT_WORD "BRANCH", "", 0, XBranch
-    BOOT_WORD "BYE", "", 0, XBYE
-    BOOT_WORD "INCLUDE", "", 0, XINCLUDE
-    BOOT_WORD "LATEST", "", 0, XLATEST
-    BOOT_WORD "?DUP", "", 0, XQDUP
-    BOOT_WORD "[']", "", 1, XBRACKET_TICK
-    BOOT_WORD "LIT-ADDR", "", 0, XLIT_ADDR
-    BOOT_WORD "0BRANCH-ADDR", "", 0, X0BRANCH_ADDR
-    BOOT_WORD "BRANCH-ADDR", "", 0, XBRANCH_ADDR
-    BOOT_WORD "EXIT-ADDR", "", 0, XEXIT_ADDR
-    BOOT_WORD "NEGATE", "", 0, XNEGATE
-    BOOT_WORD "ABS", "", 0, XABS
-    BOOT_WORD "MIN", "", 0, XMIN
-    BOOT_WORD "MAX", "", 0, XMAX
-    BOOT_WORD "LSHIFT", "", 0, XLSHIFT
-    BOOT_WORD "RSHIFT", "", 0, XRSHIFT
-    BOOT_WORD "<>", "", 0, XNEQUAL
-    BOOT_WORD "PARSE", "", 0, XPARSE
-    BOOT_WORD "WORD", "", 0, XWORD
-    BOOT_WORD "\\", "", 1, XBACKSLASH
-    BOOT_WORD "(", "", 1, XPAREN
-    BOOT_WORD "DOCON-ADDR", "", 0, XDOCON_ADDR
-    BOOT_WORD "SOURCE", "", 0, XSOURCE
-    BOOT_WORD ">IN", "", 0, XTOIN
-    BOOT_WORD "(S\")", "", 0, XSLIT
-    BOOT_WORD "S\"", "", 1, XSQUOTE
-    BOOT_WORD ".\"", "", 1, XDOTQ
-    BOOT_WORD "(DO)", "", 0, XDO_RT
-    BOOT_WORD "(?DO)", "", 0, XQDO_RT
-    BOOT_WORD "(LOOP)", "", 0, XLOOP_RT
-    BOOT_WORD "(+LOOP)", "", 0, XPLUSLOOP_RT
-    BOOT_WORD "I", "", 0, XI
-    BOOT_WORD "J", "", 0, XJ
-    BOOT_WORD "UNLOOP", "", 0, XUNLOOP
-    BOOT_WORD "LEAVE", "", 0, XLEAVE
-    BOOT_WORD "(DOES>)", "", 0, XDOES_RT
-    BOOT_WORD "PAD", "", 0, XPAD
-    BOOT_WORD "DOES>", "", 1, XDOES
-    BOOT_WORD "EVALUATE", "", 0, XEVALUATE
-    BOOT_WORD "CATCH", "", 0, XCATCH
-    BOOT_WORD "THROW", "", 0, XTHROW
-    BOOT_WORD "(CATCH-OK)", "", 0, XCATCH_OK
-    BOOT_WORD "CONTAINS", "", 0, XCONTAINS
-    BOOT_WORD "MS@", "", 0, XMSFETCH
-    BOOT_WORD "UNUSED", "", 0, XUNUSED
-    BOOT_WORD "REDEF-WARNING", "", 0, XREDEF_WARNING
-    BOOT_WORD "USER-DICT", "", 0, XUSER_DICT
-    BOOT_WORD "SP0", "", 0, XSP0
-    BOOT_WORD "SP@", "", 0, XSPFETCH
-    BOOT_WORD "SP!", "", 0, XSPSTORE
-    BOOT_WORD "SPACES", "", 0, XSPACES
-    BOOT_WORD "C,", "", 0, XCCOMMA
-    BOOT_WORD "S>D", "", 0, XSTOD
-    BOOT_WORD "2*", "", 0, XTWOSTAR
-    BOOT_WORD "2/", "", 0, XTWOSLASH
-    BOOT_WORD "2@", "", 0, XTWOFETCH
-    BOOT_WORD "2!", "", 0, XTWOSTORE
-    BOOT_WORD "UM*", "", 0, XUMSTAR
-    BOOT_WORD "M*", "", 0, XMSTAR
-    BOOT_WORD "UM/MOD", "", 0, XUMMOD
-    BOOT_WORD "SM/REM", "", 0, XSMREM
-    BOOT_WORD "FM/MOD", "", 0, XFMMOD
-    BOOT_WORD "QUIT", "", 0, XQUIT
-    BOOT_WORD "SOURCE-ID", "", 0, XSOURCE_ID
-    BOOT_WORD "REFILL", "", 0, XREFILL
-    BOOT_WORD "ACCEPT", "", 0, XACCEPT
-    BOOT_WORD ">NUMBER", "", 0, XTONUMBER
-    BOOT_WORD "ENVIRONMENT?", "", 0, XENVIRONMENT_Q
-    BOOT_WORD "FILE-ECHO", "", 0, XFILE_ECHO
-    BOOT_WORD "PARSE-NAME", "", 0, XPARSE_NAME
-    BOOT_WORD "2>R", "", 0, X2TOR
-    BOOT_WORD "2R>", "", 0, X2RTO
-    BOOT_WORD "2R@", "", 0, X2RFETCH
-    BOOT_WORD "ROLL", "", 0, XROLL
-    BOOT_WORD ":NONAME", "", 0, XNONAME
-    BOOT_WORD "(C\")", "", 0, XCSTR
-    BOOT_WORD "C\"", "", 1, XCQUOTE
-    BOOT_WORD "S\\\"", "", 1, XSESCAPE
-    BOOT_WORD "SAVE-INPUT", "", 0, XSAVE_INPUT
-    BOOT_WORD "RESTORE-INPUT", "", 0, XRESTORE_INPUT
+    BOOT_WORD "EXIT", "( -- ) return from colon definition", 0, DOEXIT
+    BOOT_WORD ";", "( -- ) end colon definition (immediate)", 1, XSEMI
+    BOOT_WORD "LIT", "( -- n ) internal: literal value", 0, XLit
+    BOOT_WORD "DUP", "( n -- n n ) duplicate top", 0, XDUP
+    BOOT_WORD "DROP", "( n -- ) discard top", 0, XDROP
+    BOOT_WORD "SWAP", "( a b -- b a ) swap top two", 0, XSWAP
+    BOOT_WORD "OVER", "( a b -- a b a ) copy second", 0, XOVER
+    BOOT_WORD "ROT", "( a b c -- b c a ) rotate top three", 0, XROT
+    BOOT_WORD "NIP", "( a b -- b ) nip", 0, XNIP
+    BOOT_WORD "TUCK", "( a b -- b a b ) tuck", 0, XTUCK
+    BOOT_WORD "PICK", "( n -- n ) pick", 0, XPICK
+    BOOT_WORD ">R", "( n -- ) ( R: -- n ) to return stack", 0, XTOR
+    BOOT_WORD "R>", "( -- n ) ( R: n -- ) from return stack", 0, XRTO
+    BOOT_WORD "R@", "( -- n ) ( R: n -- n ) copy top of return stack", 0, XRFETCH
+    BOOT_WORD "+", "( n1 n2 -- n ) addition", 0, XPLUS
+    BOOT_WORD "-", "( n1 n2 -- n ) subtraction", 0, XMINUS
+    BOOT_WORD "*", "( n1 n2 -- n ) multiplication", 0, XSTAR
+    BOOT_WORD "/", "( n1 n2 -- quot ) division (quotient)", 0, XSLASH
+    BOOT_WORD "MOD", "( n1 n2 -- rem ) modulo", 0, XMOD
+    BOOT_WORD "/MOD", "( n1 n2 -- rem quot ) remainder and quotient", 0, XSLMOD
+    BOOT_WORD "=", "( n1 n2 -- flag ) equal", 0, XEQUAL
+    BOOT_WORD "<", "( n1 n2 -- flag ) less than", 0, XLESS
+    BOOT_WORD ">", "( n1 n2 -- flag ) greater than", 0, XGREATER
+    BOOT_WORD "U<", "( u1 u2 -- flag ) unsigned less", 0, XULESS
+    BOOT_WORD "AND", "( n1 n2 -- n ) bitwise and", 0, XAND
+    BOOT_WORD "OR", "( n1 n2 -- n ) bitwise or", 0, XORR
+    BOOT_WORD "XOR", "( n1 n2 -- n ) bitwise xor", 0, XXOR
+    BOOT_WORD "INVERT", "( n -- ~n ) bitwise invert", 0, XINVERT
+    BOOT_WORD "0=", "( n -- flag ) zero?", 0, XZEQUAL
+    BOOT_WORD "0<", "( n -- flag ) negative?", 0, XZLESS
+    BOOT_WORD "TRUE", "( -- -1 ) true flag", 0, XTRUE
+    BOOT_WORD "FALSE", "( -- 0 ) false flag", 0, XFALSE
+    BOOT_WORD "1+", "( n -- n+1 ) increment", 0, XONEPLUS
+    BOOT_WORD "1-", "( n -- n-1 ) decrement", 0, XONEMINUS
+    BOOT_WORD "CELL", "( -- n ) address unit size in bytes (8)", 0, XCELL
+    BOOT_WORD "CELLS", "( n -- n ) cells to address units", 0, XCELLS
+    BOOT_WORD "@", "( addr -- n ) fetch cell", 0, XFETCH
+    BOOT_WORD "!", "( n addr -- ) store cell", 0, XSTORE
+    BOOT_WORD "C@", "( addr -- byte ) fetch byte", 0, XCFETCH
+    BOOT_WORD "C!", "( byte addr -- ) store byte", 0, XCSTORE
+    BOOT_WORD "+!", "( n addr -- ) add to memory", 0, XPLUSSTORE
+    BOOT_WORD "EMIT", "( c -- ) emit character", 0, XEMIT
+    BOOT_WORD "KEY", "( -- c ) wait for and return next key code", 0, XKEY
+    BOOT_WORD "CR", "( -- ) carriage return / newline", 0, XCR
+    BOOT_WORD ".", "( n -- ) print number (with space)", 0, XDOT
+    BOOT_WORD "U.", "( u -- ) print unsigned", 0, XUDOT
+    BOOT_WORD ".S", "( -- ) print data stack contents", 0, XDOTS
+    BOOT_WORD "TYPE", "( addr len -- ) type string", 0, XTYPE
+    BOOT_WORD "STATE", "( -- addr ) compilation state variable", 0, XSTATE
+    BOOT_WORD "BASE", "( -- addr ) current numeric base variable", 0, XBASE
+    BOOT_WORD "]", "( -- ) enter compile mode", 0, XRBRA
+    BOOT_WORD "[", "( -- ) enter interpret mode (immediate)", 1, XLBRA
+    BOOT_WORD "DP", "( -- addr ) dictionary pointer variable address (HERE is DP @)", 0, XDP
+    BOOT_WORD "HERE", "( -- addr ) current dictionary pointer (value)", 0, XHERE
+    BOOT_WORD "ALLOT", "( n -- ) allocate n bytes in dictionary", 0, XALLOT
+    BOOT_WORD ",", "( n -- ) compile a cell", 0, XCOMMA
+    BOOT_WORD "FIND", "( c-addr -- c-addr 0 | xt 1 | xt -1 ) find word from counted string (from WORD)", 0, XFIND
+    BOOT_WORD "'", "( \"<spaces>name\" -- xt ) find name, return xt", 0, XTICK
+    BOOT_WORD "EXECUTE", "( xt -- ) execute the word with the given xt", 0, XEXECUTE
+    BOOT_WORD "LITERAL", "( x -- ) compile literal x (immediate)", 1, XLITERAL
+    BOOT_WORD "IMMEDIATE", "( -- ) mark latest word as immediate", 0, XIMMEDIATE
+    BOOT_WORD ":", "( -- ) name start colon definition", 0, XCOLON
+    BOOT_WORD "CREATE", "( -- ) name create a word that pushes its data field address (for use with DOES>)", 0, XCREATE
+    BOOT_WORD "0BRANCH", "( -- ) internal: branch if zero", 0, X0Branch
+    BOOT_WORD "BRANCH", "( -- ) internal: unconditional branch", 0, XBranch
+    BOOT_WORD "BYE", "( -- ) exit Forth to the host", 0, XBYE
+    BOOT_WORD "INCLUDE", "( -- ) name parse name and INCLUDED (immediate)", 0, XINCLUDE
+    BOOT_WORD "LATEST", "( -- addr ) latest dictionary header", 0, XLATEST
+    BOOT_WORD "?DUP", "( n -- n n | 0 ) dup if non-zero", 0, XQDUP
+    BOOT_WORD "[']", "( -- xt ) compile xt of next name", 1, XBRACKET_TICK
+    BOOT_WORD "LIT-ADDR", "( -- xt ) address/xt of LIT (for SEE)", 0, XLIT_ADDR
+    BOOT_WORD "0BRANCH-ADDR", "( -- xt ) xt of 0BRANCH (for SEE)", 0, X0BRANCH_ADDR
+    BOOT_WORD "BRANCH-ADDR", "( -- xt ) xt of BRANCH (for SEE)", 0, XBRANCH_ADDR
+    BOOT_WORD "EXIT-ADDR", "( -- xt ) xt of EXIT (for SEE)", 0, XEXIT_ADDR
+    BOOT_WORD "NEGATE", "( n -- -n ) negate", 0, XNEGATE
+    BOOT_WORD "ABS", "( n -- u ) absolute value", 0, XABS
+    BOOT_WORD "MIN", "( n1 n2 -- min ) minimum", 0, XMIN
+    BOOT_WORD "MAX", "( n1 n2 -- max ) maximum", 0, XMAX
+    BOOT_WORD "LSHIFT", "( n bits -- n ) logical left shift", 0, XLSHIFT
+    BOOT_WORD "RSHIFT", "( n bits -- n ) logical right shift", 0, XRSHIFT
+    BOOT_WORD "<>", "( n1 n2 -- flag ) not equal", 0, XNEQUAL
+    BOOT_WORD "PARSE", "( xchar -- c-addr u ) parse text delimited by xchar in SOURCE (UTF-8; updates >IN)", 0, XPARSE
+    BOOT_WORD "WORD", "( char -- addr ) parse input up to delimiter char, return addr of counted string (trailing NUL)", 0, XWORD
+    BOOT_WORD "\\", "( -- ) comment to end of line (immediate)", 1, XBACKSLASH
+    BOOT_WORD "(", "( -- ) comment until ) (immediate)", 1, XPAREN
+    BOOT_WORD "DOCON-ADDR", "( -- addr ) address of DOCON code", 0, XDOCON_ADDR
+    BOOT_WORD "SOURCE", "( -- c-addr u ) current input source buffer and length", 0, XSOURCE
+    BOOT_WORD ">IN", "( -- addr ) current input pointer variable ( >IN @ for offset)", 0, XTOIN
+    BOOT_WORD "(S\")", "( -- c-addr u ) runtime for S\" / .\"", 0, XSLIT
+    BOOT_WORD "S\"", "( -- c-addr u ) compile/interpret \"-delimited string (leaves addr u)", 1, XSQUOTE
+    BOOT_WORD ".\"", "( -- ) print text until \" (immediate)", 1, XDOTQ
+    BOOT_WORD "(DO)", "( limit start -- ) internal runtime for DO (setup rstack)", 0, XDO_RT
+    BOOT_WORD "(?DO)", "( limit start -- ) internal runtime for ?DO", 0, XQDO_RT
+    BOOT_WORD "(LOOP)", "( -- ) internal runtime for LOOP", 0, XLOOP_RT
+    BOOT_WORD "(+LOOP)", "( n -- ) internal runtime for +LOOP", 0, XPLUSLOOP_RT
+    BOOT_WORD "I", "( -- n ) current DO loop index", 0, XI
+    BOOT_WORD "J", "( -- n ) outer DO loop index (for nested loops)", 0, XJ
+    BOOT_WORD "UNLOOP", "( -- ) discard current DO loop params from rstack", 0, XUNLOOP
+    BOOT_WORD "LEAVE", "( -- ) exit current DO loop (branch to after LOOP)", 0, XLEAVE
+    BOOT_WORD "(DOES>)", "( -- ) internal: patch latest CREATE word for DOES> and return from parent", 0, XDOES_RT
+    BOOT_WORD "PAD", "( -- addr ) transient user scratch (1024 bytes); not used by system parsers", 0, XPAD
+    BOOT_WORD "DOES>", "( -- ) modify last CREATE'd word to execute the following code with data addr on stack (immediate)", 1, XDOES
+    BOOT_WORD "EVALUATE", "( i*x c-addr u -- j*x ) interpret the string as Forth source", 0, XEVALUATE
+    BOOT_WORD "CATCH", "( xt -- n ) execute xt; push 0 or throw code", 0, XCATCH
+    BOOT_WORD "THROW", "( n -- ) raise exception n (0 is no-op)", 0, XTHROW
+    BOOT_WORD "(CATCH-OK)", "( -- 0 ) CATCH success path", 0, XCATCH_OK
+    BOOT_WORD "CONTAINS", "( hay-a hay-u ned-a ned-u -- flag ) case-insensitive substring", 0, XCONTAINS
+    BOOT_WORD "MS@", "( -- u ) wall-clock milliseconds since epoch", 0, XMSFETCH
+    BOOT_WORD "UNUSED", "( -- u ) bytes remaining in dictionary (HERE to dictionary limit)", 0, XUNUSED
+    BOOT_WORD "REDEF-WARNING", "( -- addr ) variable; nonzero warns on redefine", 0, XREDEF_WARNING
+    BOOT_WORD "USER-DICT", "( -- addr ) base of user dictionary", 0, XUSER_DICT
+    BOOT_WORD "SP0", "( -- addr ) empty data-stack DSP", 0, XSP0
+    BOOT_WORD "SP@", "( -- addr ) current DSP under TOS", 0, XSPFETCH
+    BOOT_WORD "SP!", "( n -- ) set data stack pointer (updates both cell and internal)", 0, XSPSTORE
+    BOOT_WORD "SPACES", "( n -- ) emit n spaces", 0, XSPACES
+    BOOT_WORD "C,", "( b -- ) compile a byte", 0, XCCOMMA
+    BOOT_WORD "S>D", "( n -- d ) sign extend single to double", 0, XSTOD
+    BOOT_WORD "2*", "( x1 -- x2 ) shift left one bit (multiply by two)", 0, XTWOSTAR
+    BOOT_WORD "2/", "( x1 -- x2 ) arithmetic shift right one bit (divide by two)", 0, XTWOSLASH
+    BOOT_WORD "2@", "( addr -- n1 n2 ) fetch two cells", 0, XTWOFETCH
+    BOOT_WORD "2!", "( n1 n2 addr -- ) store two cells", 0, XTWOSTORE
+    BOOT_WORD "UM*", "( u1 u2 -- ud ) unsigned double multiply", 0, XUMSTAR
+    BOOT_WORD "M*", "( n1 n2 -- d ) signed double multiply (low high)", 0, XMSTAR
+    BOOT_WORD "UM/MOD", "( ud u -- rem quot ) unsigned divmod", 0, XUMMOD
+    BOOT_WORD "SM/REM", "( d n -- rem quot ) symmetric divmod", 0, XSMREM
+    BOOT_WORD "FM/MOD", "( d n -- rem quot ) floored divmod", 0, XFMMOD
+    BOOT_WORD "QUIT", "( -- ) empty return stack, set interpret state, return to outer interpreter", 0, XQUIT
+    BOOT_WORD "SOURCE-ID", "( -- id ) input source id (-1 terminal, 0 evaluate, 1 file)", 0, XSOURCE_ID
+    BOOT_WORD "REFILL", "( -- flag ) attempt to refill the input buffer; flag true if successful", 0, XREFILL
+    BOOT_WORD "ACCEPT", "( c-addr +n1 -- +n2 ) read up to n1 chars from input into buffer", 0, XACCEPT
+    BOOT_WORD ">NUMBER", "( ud1 c-addr1 u1 -- ud2 c-addr2 u2 ) convert string digits to number accumulating in ud", 0, XTONUMBER
+    BOOT_WORD "ENVIRONMENT?", "( c-addr u -- false | i*x true ) query environment string", 0, XENVIRONMENT_Q
+    BOOT_WORD "FILE-ECHO", "( -- addr ) variable controlling loaded-source echo (FLOAD, INCLUDE, …; use with ON/OFF)", 0, XFILE_ECHO
+    BOOT_WORD "PARSE-NAME", "( -- c-addr u ) parse name from input (skip leading blanks, BL-delimited)", 0, XPARSE_NAME
+    BOOT_WORD "2>R", "( n1 n2 -- ) (R: -- ) two to return stack", 0, X2TOR
+    BOOT_WORD "2R>", "( -- n1 n2 ) (R: -- ) two from return stack", 0, X2RTO
+    BOOT_WORD "2R@", "( -- n1 n2 ) (R: -- ) copy two from return stack", 0, X2RFETCH
+    BOOT_WORD "ROLL", "( n -- ) roll", 0, XROLL
+    BOOT_WORD ":NONAME", "( C: -- colon-sys ) ( -- xt ) start anonymous colon definition; ; leaves xt", 0, XNONAME
+    BOOT_WORD "(C\")", "( -- c-addr ) runtime for C\"", 0, XCSTR
+    BOOT_WORD "C\"", "( -- c-addr ) compile \"-delimited counted string (run-time: addr of length byte)", 1, XCQUOTE
+    BOOT_WORD "S\\\"", "( -- ) compile escaped \"-delimited string (leaves c-addr u at run-time)", 1, XSESCAPE
+    BOOT_WORD "SAVE-INPUT", "( -- x1 ... xn n ) save current input source state for RESTORE-INPUT", 0, XSAVE_INPUT
+    BOOT_WORD "RESTORE-INPUT", "( x1 ... xn n -- flag ) restore input source; flag true if failed", 0, XRESTORE_INPUT
     .quad 0, 0, 0, 0
 
 .equ BOOT_WORD_COUNT, 144

@@ -5254,8 +5254,11 @@ forth_init_str:
     .ascii ": >FLAGS 8 - ; "
     .ascii ": >CODE ; "
     .ascii ": >BODY 8 + ; "
-    // NFA = CFA - (FLAGS & 0xFFFFFFFF); NAME>STRING = COUNT at NFA
-    .ascii ": NAME>STRING DUP >FLAGS @ 4294967295 AND - COUNT ; "
+    // NFA = CFA - (FLAGS & 0xFFFFFFFF); name then help are counted+padded records
+    .ascii ": NFA DUP >FLAGS @ 4294967295 AND - ; "
+    .ascii ": NAME>STRING NFA COUNT ; "
+    // NAME>HELP ( xt -- c-addr u )  counted help string after padded name record
+    .ascii ": NAME>HELP NFA DUP C@ CHAR+ ALIGNED + COUNT ; "
 
     // --- 3. Control flow (immediate) ---
     .ascii ": BEGIN HERE ; IMMEDIATE "
@@ -5324,8 +5327,11 @@ forth_init_str:
     .ascii ": DOCOL? @ ['] WORDS @ = ; "
     // SEE: walk colon body; skip inline data after LIT, (S"), BRANCH, 0BRANCH,
     // (LOOP), and (+LOOP). Ordinary xts (including (DO), (DOES>), EXIT) are 1 cell.
-    .ascii ": SEE ' DUP DOCOL? IF 58 EMIT SPACE ELSE 67 EMIT 79 EMIT 68 EMIT 69 EMIT SPACE THEN DUP NAME>STRING TYPE SPACE DUP DOCOL? 0= IF DROP 40 EMIT 112 EMIT 114 EMIT 105 EMIT 109 EMIT 105 EMIT 116 EMIT 105 EMIT 118 EMIT 101 EMIT 41 EMIT CR EXIT THEN >BODY BEGIN DUP @ DUP EXIT-ADDR = IF 2DROP 59 EMIT CR EXIT THEN DUP LIT-ADDR = IF DROP 8 + DUP @ . 8 + ELSE DUP ['] (S\") = IF DROP 8 + DUP @ >R 8 + 83 EMIT 34 EMIT SPACE DUP R@ TYPE 34 EMIT SPACE R> + ALIGNED ELSE DUP NAME>STRING TYPE SPACE DUP BRANCH-ADDR = OVER 0BRANCH-ADDR = OR OVER ['] (LOOP) = OR OVER ['] (+LOOP) = OR IF DROP 8 + DUP @ . SPACE 8 + ELSE DROP 8 + THEN THEN THEN AGAIN ; "
+    // ALIAS copies CODE field only — correct for CODE words (e.g. FLOAD/INCLUDE)
     .ascii ": ALIAS CREATE LATEST @ SWAP @ SWAP ! ; "
+    // SEE / HELP — name, help text, then body or (primitive). HELP is a thin colon wrapper.
+    .ascii ": SEE ' DUP DOCOL? IF 58 EMIT SPACE ELSE 67 EMIT 79 EMIT 68 EMIT 69 EMIT SPACE THEN DUP NAME>STRING TYPE CR DUP NAME>HELP DUP IF TYPE CR ELSE 2DROP THEN DUP DOCOL? 0= IF DROP 40 EMIT 112 EMIT 114 EMIT 105 EMIT 109 EMIT 105 EMIT 116 EMIT 105 EMIT 118 EMIT 101 EMIT 41 EMIT CR EXIT THEN >BODY BEGIN DUP @ DUP EXIT-ADDR = IF 2DROP 59 EMIT CR EXIT THEN DUP LIT-ADDR = IF DROP 8 + DUP @ . 8 + ELSE DUP ['] (S\") = IF DROP 8 + DUP @ >R 8 + 83 EMIT 34 EMIT SPACE DUP R@ TYPE 34 EMIT SPACE R> + ALIGNED ELSE DUP NAME>STRING TYPE SPACE DUP BRANCH-ADDR = OVER 0BRANCH-ADDR = OR OVER ['] (LOOP) = OR OVER ['] (+LOOP) = OR IF DROP 8 + DUP @ . SPACE 8 + ELSE DROP 8 + THEN THEN THEN AGAIN ; "
+    .ascii ": HELP SEE ; "
     .ascii "' INCLUDE ALIAS FLOAD "
     // .FREE ( -- )  print free user-dictionary bytes (UNUSED is the cell value)
     .ascii ": .FREE UNUSED U. SPACE S\" bytes free\" TYPE CR ; "
