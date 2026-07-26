@@ -84,8 +84,8 @@ boot_word_table:
     BOOT_WORD "EXECUTE", "EXECUTE ( xt -- ) execute the word with the given xt", 0, XEXECUTE
     BOOT_WORD "LITERAL", "LITERAL ( x -- ) compile literal x (immediate)", 1, XLITERAL
     BOOT_WORD "IMMEDIATE", "IMMEDIATE ( -- ) mark latest word as immediate", 0, XIMMEDIATE
-    BOOT_WORD ":", ": ( -- ) name start colon definition", 0, XCOLON
-    BOOT_WORD "CREATE", "CREATE ( -- ) name create a word that pushes its data field address (for use with DOES>)", 0, XCREATE
+    BOOT_WORD ":", ": ( 'name' -- ) start colon definition", 0, XCOLON
+    BOOT_WORD "CREATE", "CREATE ( 'name' -- ) create word that pushes its data field (for DOES>)", 0, XCREATE
     BOOT_WORD "0BRANCH", "0BRANCH ( -- ) internal: branch if zero", 0, X0Branch
     BOOT_WORD "BRANCH", "BRANCH ( -- ) internal: unconditional branch", 0, XBranch
     BOOT_WORD "BYE", "BYE ( -- ) exit Forth to the host", 0, XBYE

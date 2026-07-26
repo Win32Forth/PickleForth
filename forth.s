@@ -5366,14 +5366,14 @@ forth_init_str:
     .ascii ": +LOOP ?COMP ['] (+LOOP) , HERE - , ?DUP IF HERE OVER - SWAP ! THEN ; IMMEDIATE "
 
     // --- 4. Defining words / parse helpers using the above ---
-    .ascii "DOC\" CHAR ( name -- xchar ) parse BL-delimited name, return first xchar (UTF-8)\" "
+    .ascii "DOC\" CHAR ( 'name' -- char ) first character of next word\" "
     .ascii ": CHAR BL WORD COUNT DROP C@ ; "
-    .ascii "DOC\" [CHAR] ( name -- ) compile first xchar of name as literal (immediate)\" "
+    .ascii "DOC\" [CHAR] ( 'name' -- ) compile first char of name as literal (immediate)\" "
     .ascii ": [CHAR] ?COMP CHAR LIT-ADDR , , ; IMMEDIATE "
-    .ascii "DOC\" VARIABLE ( -- ) name create a variable\" "
+    .ascii "DOC\" VARIABLE ( 'name' -- ) create a variable\" "
     .ascii ": VARIABLE CREATE 0 , ; "
     // CONSTANT via DOES> (body+0=does_ip, body+8=value; DOES> action @ )
-    .ascii "DOC\" CONSTANT ( n -- ) name create a constant\" "
+    .ascii "DOC\" CONSTANT ( x 'name' -- ) create a constant\" "
     .ascii ": CONSTANT CREATE , DOES> @ ; "
     .ascii "DOC\" RECURSE ( -- ) recurse into current definition (immediate)\" "
     .ascii ": RECURSE ?COMP LATEST @ , ; IMMEDIATE "
@@ -5416,7 +5416,7 @@ forth_init_str:
     //   non-immediate: compile LIT xt (COMP,)  so runtime compiles xt via ,
     .ascii "DOC\" (COMP,) ( xt -- ) compile xt (for POSTPONE)\" "
     .ascii ": (COMP,) , ; "
-    .ascii "DOC\" POSTPONE ( -- ) name append compilation semantics of next word (immediate)\" "
+    .ascii "DOC\" POSTPONE ( 'name' -- ) compile compilation semantics of name (immediate)\" "
     .ascii ": POSTPONE ?COMP BL WORD FIND DUP 0= IF 2DROP EXIT THEN 1 = IF , ELSE LIT-ADDR , , ['] (COMP,) , THEN ; IMMEDIATE "
 
     // CASE OF ENDOF ENDCASE (ANS-style; compilation only)
@@ -5433,14 +5433,14 @@ forth_init_str:
     // WORDS [string]  list all names, or only those containing string (case-insensitive).
     // Keep filter (fa fu) under the walk: >R / 2DUP / R@ NAME>STRING / 2SWAP so CONTAINS
     // does not consume the filter (previous ROT >R 2SWAP path ate fa fu on first match check).
-    .ascii "DOC\" WORDS ( -- ) [name] list words in first search-order wordlist (optional name filter)\" "
+    .ascii "DOC\" WORDS ( ['filter'] -- ) list words; optional substring filter\" "
     .ascii ": WORDS BL WORD COUNT LATEST @ BEGIN DUP WHILE >R 2DUP R@ NAME>STRING 2SWAP CONTAINS IF R@ NAME>STRING TYPE SPACE THEN R> >LINK @ REPEAT DROP 2DROP CR ; "
     .ascii "DOC\" DOCOL? ( xt -- flag ) true if colon definition\" "
     .ascii ": DOCOL? @ ['] WORDS @ = ; "
     // SEE: walk colon body; skip inline data after LIT, (S"), BRANCH, 0BRANCH,
     // (LOOP), and (+LOOP). Ordinary xts (including (DO), (DOES>), EXIT) are 1 cell.
     // ALIAS copies CODE field only — correct for CODE words (e.g. FLOAD/INCLUDE)
-    .ascii "DOC\" ALIAS ( xt name -- ) define name with same CODE as xt\" "
+    .ascii "DOC\" ALIAS ( xt 'name' -- ) define name with same CODE field as xt\" "
     .ascii ": ALIAS CREATE LATEST @ SWAP @ SWAP ! ; "
     // SEE / HELP — one-line header, then body walk.
     // (SEE-BR?) ( xt -- flag ) true if BRANCH / 0BRANCH / (LOOP) / (+LOOP)
@@ -5448,9 +5448,9 @@ forth_init_str:
     .ascii ": (SEE-BR?) >R R@ BRANCH-ADDR = R@ 0BRANCH-ADDR = OR R@ ['] (LOOP) = OR R@ ['] (+LOOP) = OR R> DROP ; "
     // Hold each body cell in R so NAME>STRING cannot drop the xt before branch tests.
     // NAME>HELP empty path must leave xt: 2DROP DUP NAME>STRING (not 2DROP NAME>STRING).
-    .ascii "DOC\" SEE ( -- name ) decompile a word\" "
+    .ascii "DOC\" SEE ( 'name' -- ) show help and decompile word\" "
     .ascii ": SEE ' DUP DOCOL? IF 58 EMIT SPACE ELSE 67 EMIT 79 EMIT 68 EMIT 69 EMIT SPACE THEN DUP NAME>HELP DUP IF TYPE ELSE 2DROP DUP NAME>STRING TYPE THEN CR DUP DOCOL? 0= IF DROP 40 EMIT 112 EMIT 114 EMIT 105 EMIT 109 EMIT 105 EMIT 116 EMIT 105 EMIT 118 EMIT 101 EMIT 41 EMIT CR EXIT THEN >BODY BEGIN DUP @ >R R@ EXIT-ADDR = IF R> DROP DROP 59 EMIT CR EXIT THEN R@ LIT-ADDR = IF R> DROP 8 + DUP @ . SPACE 8 + ELSE R@ ['] (S\") = IF R> DROP 8 + DUP @ >R 8 + 83 EMIT 34 EMIT SPACE DUP R@ TYPE 34 EMIT SPACE R> + ALIGNED ELSE R@ (SEE-BR?) IF R@ NAME>STRING TYPE SPACE R> DROP 8 + DUP @ . SPACE 8 + ELSE R@ NAME>STRING TYPE SPACE R> DROP 8 + THEN THEN THEN AGAIN ; "
-    .ascii "DOC\" HELP ( -- ) name show help for a word\" "
+    .ascii "DOC\" HELP ( 'name' -- ) show help and decompile word (same as SEE)\" "
     .ascii ": HELP SEE ; "
     .ascii "' INCLUDE ALIAS FLOAD "
     // .FREE ( -- )  print free user-dictionary bytes (UNUSED is the cell value)
@@ -5465,7 +5465,7 @@ forth_init_str:
     .ascii "DOC\" .ELAPSED ( ms -- ) print ms as HH:MM:SS.mmm\" "
     .ascii ": .ELAPSED BASE @ >R DECIMAL 1000 /MOD SWAP >R 60 /MOD SWAP >R 60 /MOD SWAP >R DUP 10 < IF 48 EMIT THEN <# #S #> TYPE 58 EMIT R> .2DIG 58 EMIT R> .2DIG 46 EMIT R> .3DIG R> BASE ! ; "
     // ELAPSED <name>  run name once; print wall time as HH:MM:SS.mmm
-    .ascii "DOC\" ELAPSED ( name -- ) time execution of name\" "
+    .ascii "DOC\" ELAPSED ( 'name' -- ) run name once and print elapsed time\" "
     .ascii ": ELAPSED ' >R MS@ R@ EXECUTE MS@ SWAP - .ELAPSED CR R> DROP ; "
     // DUMP ( addr u -- )  classic hex+ASCII dump, 16 bytes/line
     // .H2 byte as 2 hex digits; .HA address as 16 hex digits (BASE=HEX)
@@ -5495,10 +5495,10 @@ forth_init_str:
     // FORGET <name>  remove name and all newer words; rewind HERE to name's header.
     // FIND leaves (c-addr 0|xt flag); 0= IF consumes flag — do not DROP xt after THEN.
     // Refuses names below USER-DICT (static kernel). HERE rewound via negative ALLOT.
-    .ascii "DOC\" FORGET ( -- ) name forget name and all later words; prune every wordlist\" "
+    .ascii "DOC\" FORGET ( 'name' -- ) remove name and all newer words\" "
     .ascii ": FORGET BL WORD FIND 0= IF DROP 63 EMIT CR EXIT THEN DUP USER-DICT U< IF DROP S\" protected\" TYPE CR EXIT THEN DUP >LINK @ LATEST ! DUP HERE - ALLOT DROP ; "
     // ANEW <name>  marker for reloadable modules (classic FPC/Win32Forth style).
-    .ascii "DOC\" ANEW ( name -- ) marker: forget previous then CREATE\" "
+    .ascii "DOC\" ANEW ( 'name' -- ) if name exists FORGET it, then CREATE name\" "
     .ascii ": ANEW >IN @ >R BL WORD FIND IF EXECUTE ELSE DROP THEN R> >IN ! CREATE LATEST @ , DOES> @ DUP >LINK @ LATEST ! DUP HERE - ALLOT DROP ; "
     // ON / OFF — store 1 or 0 at addr (classic: FILE-ECHO ON  /  FILE-ECHO OFF)
     .ascii "DOC\" ON ( addr -- ) store 1 at addr (e.g. file-echo ON)\" "
@@ -5516,30 +5516,30 @@ forth_init_str:
     .ascii ": HOLDS BEGIN DUP WHILE 1- 2DUP + C@ HOLD REPEAT 2DROP ; "
     .ascii "DOC\" COMPILE, ( xt -- ) compile the execution token xt\" "
     .ascii ": COMPILE, , ; "
-    .ascii "DOC\" [COMPILE] ( -- ) name force compile of next word even if immediate (immediate)\" "
+    .ascii "DOC\" [COMPILE] ( 'name' -- ) force-compile name even if immediate (immediate)\" "
     .ascii ": [COMPILE] ?COMP BL WORD FIND 0= IF DROP EXIT THEN DROP , ; IMMEDIATE "
     .ascii "DOC\" .( ( -- ) print text until ) immediately (immediate)\" "
     .ascii ": .( 41 PARSE TYPE ; IMMEDIATE "
-    .ascii "DOC\" BUFFER: ( u -- ) name create an aligned buffer of u bytes\" "
+    .ascii "DOC\" BUFFER: ( u 'name' -- ) create a buffer of u bytes\" "
     .ascii ": BUFFER: CREATE ALLOT ; "
     // VALUE / TO — DOES> body: does_ip at >BODY, value at >BODY CELL+
-    .ascii "DOC\" VALUE ( n -- ) name create a value (mutable constant); set with IS or TO\" "
+    .ascii "DOC\" VALUE ( x 'name' -- ) create a value; change with TO\" "
     .ascii ": VALUE CREATE , DOES> @ ; "
-    .ascii "DOC\" TO ( n -- ) name store n into a VALUE (parsing)\" "
+    .ascii "DOC\" TO ( x 'name' -- ) store x into a VALUE (immediate)\" "
     .ascii ": TO ' >BODY CELL+ STATE @ IF POSTPONE LITERAL POSTPONE ! ELSE ! THEN ; IMMEDIATE "
     // DEFER family — default action ABORT until IS
-    .ascii "DOC\" DEFER ( -- ) name create a deferred word (execution can be changed)\" "
+    .ascii "DOC\" DEFER ( 'name' -- ) create a deferred word (set with IS)\" "
     .ascii ": DEFER CREATE ['] ABORT , DOES> @ EXECUTE ; "
     .ascii "DOC\" DEFER@ ( xt1 -- xt2 ) get the xt that defer xt1 currently executes\" "
     .ascii ": DEFER@ >BODY CELL+ @ ; "
     .ascii "DOC\" DEFER! ( xt1 xt2 -- ) set defer xt2 to execute xt1\" "
     .ascii ": DEFER! >BODY CELL+ ! ; "
-    .ascii "DOC\" IS ( xt -- ) name set the xt for a DEFER or the value for a VALUE (parsing)\" "
+    .ascii "DOC\" IS ( xt 'name' -- ) set DEFER or VALUE named (immediate)\" "
     .ascii ": IS STATE @ IF POSTPONE ['] POSTPONE DEFER! ELSE ' DEFER! THEN ; IMMEDIATE "
-    .ascii "DOC\" ACTION-OF ( xt1 -- xt2 ) current execution token of a deferred word (like DEFER@)\" "
+    .ascii "DOC\" ACTION-OF ( 'name' -- xt ) xt currently in deferred name (immediate)\" "
     .ascii ": ACTION-OF STATE @ IF POSTPONE ['] POSTPONE DEFER@ ELSE ' DEFER@ THEN ; IMMEDIATE "
     // MARKER — executing name restores dictionary to just before MARKER was defined
-    .ascii "DOC\" MARKER ( -- ) name create a restore point for dictionary and search order\" "
+    .ascii "DOC\" MARKER ( 'name' -- ) create a dictionary restore point\" "
     .ascii ": MARKER CREATE LATEST @ , DOES> @ DUP >LINK @ LATEST ! DUP HERE - ALLOT DROP ; "
 
     .byte 0  // null terminator
