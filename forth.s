@@ -18,17 +18,17 @@
 //   syscalls do NOT corrupt the Forth VM registers. The real hazard is
 //   assembly helpers that temporarily borrow x19-x24 without saving them.
 //
-// Dictionary entry format (each entry 8-byte aligned):
-//   +0:  link (8 bytes, pointer to previous entry or 0)     >LINK
-//   +8:  flags|len (8 bytes, low byte=name length, bit 8=immediate)  >FLAGS
-//   +16: code_field (8 bytes, pointer to native code)      >CODE
-//   +24: name (padded to 8-byte multiple)                  >NAME
-//   after name: body / parameter field                     >BODY
+// Dictionary header format (built at runtime; grows up with HERE):
+//   NFA:  counted NAME (uppercase), pad to 8 bytes
+//   HFA:  counted COMMENT (stack pic + text), pad to 8 (may be empty)
+//   LFA:  LINK  = previous word's CFA (or 0)           @ CFA-16  >LINK
+//   FFA:  FLAGS = NFA_OFF in low 32 bits, IMM in bit 32 @ CFA-8   >FLAGS
+//   CFA:  CODE  = native code pointer  (** xt from ' / FIND **)  >CODE (= xt)
+//   BODY: parameter / threaded code                     @ CFA+8   >BODY
 //
-// In this system an xt from ' / FIND is the entry address (not the CFA).
-// >CODE converts xt to the code-field address;  >CODE @  fetches the code ptr.
-//
-// NEXT: load dict_entry from *IP, load code_field from entry, jump.
+// LATEST holds the CFA of the newest word.
+// NEXT: W = xt = CFA from *IP; branch to *W.
+// All headers are built by _header_build (boot table + : / CREATE).
 //
 // ----------------------------------------------------------------------------
 // ANS Forth 2012 compatibility
@@ -65,8 +65,7 @@
 //   Except:   CATCH THROW  (Exception word set; used by ABORT path)
 //
 // Implementation choices / differences (still ANS-legal where noted):
-//   xt from ' / FIND / [']  = dictionary *entry* address (not CFA).
-//     ANS xt is opaque; EXECUTE expects that entry. >CODE gives the CFA.
+//   xt from ' / FIND / [']  = CFA (code-field address). ANS xt is opaque.
 //   / MOD /MOD              = symmetric (toward zero), ARM sdiv; FLOORED false.
 //   >BODY                   = after name for any xt (used by SEE on colon words);
 //                             ANS text is oriented toward CREATE bodies.
@@ -127,15 +126,15 @@
 // Macros
 // ============================================================================
 .macro NEXT
-    ldr x21, [x19], #8
-    ldr x1, [x21, #16]
+    ldr x21, [x19], #8          // W = CFA (xt)
+    ldr x1, [x21]               // code field at CFA
     br x1
 .endm
 
 // Debug version of NEXT
 .macro DEBUG_NEXT
     ldr x21, [x19], #8
-    ldr x1, [x21, #16]
+    ldr x1, [x21]
     // Store crash diagnostics and write to stderr
     stp x0, x1, [sp, #-16]!
     adrp x0, next_diag@page
@@ -205,10 +204,8 @@ _main:
     // Initialize TOS (empty stack)
     mov  x20, #0
 
-    // Initialize latest_var to newest static word
-    adrp x0, dict_restore_input@page
-    add  x0, x0, dict_restore_input@pageoff
-    str  x0, [x24]
+    // LATEST empty until boot catalog is built
+    str  xzr, [x24]
 
     // HERE = user_dict_area
     adrp x0, here_ptr@page
@@ -220,14 +217,14 @@ _main:
     // Catch SIGSEGV/SIGBUS (e.g. @ on address 0) and return to QUIT
     bl _install_fault_handlers
 
-    // Patch all dict entry code fields (Mach-O chained fixups broken for .quad cross-section refs)
-    bl _patch_dict
+    // Build all CODE word headers from boot_word_table into the user dictionary
+    bl _boot_kernel
 
     // Print welcome via raw SVC
     mov x0, #1
     adrp x1, str_hello@page
     add x1, x1, str_hello@pageoff
-    mov x2, #19                    // "PickleForth v0.2.0\n"
+    mov x2, #19                    // "PickleForth v0.3.0\n"
     mov x16, #4
     svc #0x80
 
@@ -287,20 +284,17 @@ _fault_handler:
 // ============================================================================
 // DOCOL / DOEXIT / DOVAR
 // ============================================================================
-// Body of a colon/CREATE word starts after the 8-byte-aligned name field.
-// name_len = flags|len & 0xFF; name_bytes = (name_len + 7) & ~7; body = entry+24+name_bytes
-.macro DICT_BODY_ADDR dst, entry
-    ldr \dst, [\entry, #8]
-    and \dst, \dst, #0xFF
-    add \dst, \dst, #7
-    bic \dst, \dst, #7
-    add \dst, \entry, \dst
-    add \dst, \dst, #24
+// xt = CFA = x21. Body always at CFA+8. CREATE: does_ip @ CFA+8, PFA @ CFA+16.
+.equ FLAG_IMM, 0x100000000          // bit 32 of FLAGS cell
+.equ NFA_OFF_MASK, 0xFFFFFFFF
+
+.macro DICT_BODY_ADDR dst, cfa
+    add \dst, \cfa, #8
 .endm
 
 DOCOL:
     RPUSH
-    DICT_BODY_ADDR x19, x21
+    add x19, x21, #8               // IP = body (CFA+8)
     NEXT
 
 DOEXIT:
@@ -308,642 +302,315 @@ DOEXIT:
     NEXT
 
 DOVAR:
-    // PFA = body+8 (body+0 reserved for does_ip)
+    // Push user PFA = CFA+16 (does_ip lives at CFA+8)
     str x20, [x22, #-8]!
-    DICT_BODY_ADDR x20, x21
-    add x20, x20, #8
+    add x20, x21, #16
     NEXT
 
 DOCON:
     str x20, [x22, #-8]!
-    DICT_BODY_ADDR x0, x21
-    ldr x20, [x0, #8]              // value at user PFA
+    ldr x20, [x21, #16]            // value at PFA (CFA+16)
     NEXT
 
-// DODOES: push PFA (body+8), run high-level fragment at [body+0]
+// DODOES: push PFA (CFA+16), run high-level fragment at [CFA+8]
 DODOES:
     RPUSH
-    DICT_BODY_ADDR x0, x21
-    ldr x19, [x0]                  // does_ip
-    add x0, x0, #8                 // PFA
+    ldr x19, [x21, #8]             // does_ip
+    add x0, x21, #16               // PFA
     str x20, [x22, #-8]!
     mov x20, x0
     NEXT
 
 // ============================================================================
-// _patch_dict - Patch all dict entry links and code fields at startup
-// Uses ADR (PC-relative, ±1MB) instead of ADRP+ADD to avoid chained fixup issues.
+// Dictionary header builder (runtime) + kernel boot from structured records
 // ============================================================================
-_patch_dict:
-    .macro PATCH_LINK dict_entry, prev_entry
-    adrp x0, \dict_entry@page
-    add  x0, x0, \dict_entry@pageoff
-    adrp x1, \prev_entry@page
-    add  x1, x1, \prev_entry@pageoff
-    str  x1, [x0]
-    .endm
+// _header_build:
+//   x0=name addr, x1=name len, x2=help addr, x3=help len, x4=code addr, x5=imm(0/1)
+//   Builds: NFA name | HFA help | LFA link | FFA flags | CFA code
+//   HERE advanced to CFA+8 (body start). LATEST = CFA. Returns x0 = CFA.
+//   Names stored UPPERCASE. Counted strings, pad each field to 8 bytes.
+// ============================================================================
+.align 4
+_header_build:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    stp x19, x20, [sp, #-16]!
+    stp x21, x22, [sp, #-16]!
+    stp x23, x24, [sp, #-16]!
+    // save args
+    mov x19, x0                    // name
+    mov x20, x1                    // nlen
+    mov x21, x2                    // help
+    mov x22, x3                    // hlen
+    mov x23, x4                    // code
+    // x5 imm kept in x5; x24 is latest ptr — reload after saves
+    // Actually we clobbered x24! Save imm in stack and restore x24 from global
+    str x5, [sp, #-16]!            // imm
 
-    .macro PATCH_CODE dict_entry, native_code
-    adrp x0, \dict_entry@page
-    add  x0, x0, \dict_entry@pageoff
-    adrp x1, \native_code@page
-    add  x1, x1, \native_code@pageoff
-    str  x1, [x0, #16]
-    .endm
+    adrp x24, latest_var@page
+    add x24, x24, latest_var@pageoff
 
-    // Patch link chain (dict_exit link=0 is already correct)
-    PATCH_LINK dict_semi, dict_exit
-    nop
-    PATCH_LINK dict_lit, dict_semi
-    nop
-    PATCH_LINK dict_dup, dict_lit
-    nop
-    PATCH_LINK dict_drop, dict_dup
-    nop
-    PATCH_LINK dict_swap, dict_drop
-    nop
-    PATCH_LINK dict_over, dict_swap
-    nop
-    PATCH_LINK dict_rot, dict_over
-    nop
-    PATCH_LINK dict_nip, dict_rot
-    nop
-    PATCH_LINK dict_tuck, dict_nip
-    nop
-    PATCH_LINK dict_pick, dict_tuck
-    nop
-    PATCH_LINK dict_tor, dict_pick
-    nop
-    PATCH_LINK dict_rto, dict_tor
-    nop
-    PATCH_LINK dict_rfetch, dict_rto
-    nop
-    PATCH_LINK dict_plus, dict_rfetch
-    nop
-    PATCH_LINK dict_minus, dict_plus
-    nop
-    PATCH_LINK dict_star, dict_minus
-    nop
-    PATCH_LINK dict_slash, dict_star
-    nop
-    PATCH_LINK dict_mod, dict_slash
-    nop
-    PATCH_LINK dict_slmod, dict_mod
-    nop
-    PATCH_LINK dict_equal, dict_slmod
-    nop
-    PATCH_LINK dict_less, dict_equal
-    nop
-    PATCH_LINK dict_greater, dict_less
-    nop
-    PATCH_LINK dict_uless, dict_greater
-    nop
-    PATCH_LINK dict_and, dict_uless
-    nop
-    PATCH_LINK dict_or, dict_and
-    nop
-    PATCH_LINK dict_xor, dict_or
-    nop
-    PATCH_LINK dict_invert, dict_xor
-    nop
-    PATCH_LINK dict_zequal, dict_invert
-    nop
-    PATCH_LINK dict_zless, dict_zequal
-    nop
-    PATCH_LINK dict_true, dict_zless
-    nop
-    PATCH_LINK dict_false, dict_true
-    nop
-    PATCH_LINK dict_oneplus, dict_false
-    nop
-    PATCH_LINK dict_oneminus, dict_oneplus
-    nop
-    PATCH_LINK dict_cell, dict_oneminus
-    nop
-    PATCH_LINK dict_cells, dict_cell
-    nop
-    PATCH_LINK dict_fetch, dict_cells
-    nop
-    PATCH_LINK dict_store, dict_fetch
-    nop
-    PATCH_LINK dict_cfetch, dict_store
-    nop
-    PATCH_LINK dict_cstore, dict_cfetch
-    nop
-    PATCH_LINK dict_plusstore, dict_cstore
-    nop
-    PATCH_LINK dict_emit, dict_plusstore
-    nop
-    PATCH_LINK dict_key, dict_emit
-    nop
-    PATCH_LINK dict_cr, dict_key
-    nop
-    PATCH_LINK dict_dot, dict_cr
-    nop
-    PATCH_LINK dict_udot, dict_dot
-    nop
-    PATCH_LINK dict_dots, dict_udot
-    nop
-    PATCH_LINK dict_type, dict_dots
-    nop
-    PATCH_LINK dict_state, dict_type
-    nop
-    PATCH_LINK dict_base, dict_state
-    nop
-    PATCH_LINK dict_rbrack, dict_base
-    nop
-    PATCH_LINK dict_lbrack, dict_rbrack
-    nop
+    adrp x0, here_ptr@page
+    add x0, x0, here_ptr@pageoff
+    ldr x6, [x0]                   // HERE = NFA
+    mov x7, x6                     // keep NFA
 
-    // Patch code fields
-    PATCH_CODE dict_exit, DOEXIT
-    nop
-    PATCH_CODE dict_semi, XSEMI
-    nop
-    PATCH_CODE dict_lit, XLit
-    nop
-    PATCH_CODE dict_dup, XDUP
-    nop
-    PATCH_CODE dict_drop, XDROP
-    nop
-    PATCH_CODE dict_swap, XSWAP
-    nop
-    PATCH_CODE dict_over, XOVER
-    nop
-    PATCH_CODE dict_rot, XROT
-    nop
-    PATCH_CODE dict_nip, XNIP
-    nop
-    PATCH_CODE dict_tuck, XTUCK
-    nop
-    PATCH_CODE dict_pick, XPICK
-    nop
-    PATCH_CODE dict_tor, XTOR
-    nop
-    PATCH_CODE dict_rto, XRTO
-    nop
-    PATCH_CODE dict_rfetch, XRFETCH
-    nop
-    PATCH_CODE dict_plus, XPLUS
-    nop
-    PATCH_CODE dict_minus, XMINUS
-    nop
-    PATCH_CODE dict_star, XSTAR
-    nop
-    PATCH_CODE dict_slash, XSLASH
-    nop
-    PATCH_CODE dict_mod, XMOD
-    nop
-    PATCH_CODE dict_slmod, XSLMOD
-    nop
-    PATCH_CODE dict_equal, XEQUAL
-    nop
-    PATCH_CODE dict_less, XLESS
-    nop
-    PATCH_CODE dict_greater, XGREATER
-    nop
-    PATCH_CODE dict_uless, XULESS
-    nop
-    PATCH_CODE dict_and, XAND
-    nop
-    PATCH_CODE dict_or, XORR
-    nop
-    PATCH_CODE dict_xor, XXOR
-    nop
-    PATCH_CODE dict_invert, XINVERT
-    nop
-    PATCH_CODE dict_zequal, XZEQUAL
-    nop
-    PATCH_CODE dict_zless, XZLESS
-    nop
-    PATCH_CODE dict_true, XTRUE
-    nop
-    PATCH_CODE dict_false, XFALSE
-    nop
-    PATCH_CODE dict_oneplus, XONEPLUS
-    nop
-    PATCH_CODE dict_oneminus, XONEMINUS
-    nop
-    PATCH_CODE dict_cell, XCELL
-    nop
-    PATCH_CODE dict_cells, XCELLS
-    nop
-    PATCH_CODE dict_fetch, XFETCH
-    nop
-    PATCH_CODE dict_store, XSTORE
-    nop
-    PATCH_CODE dict_cfetch, XCFETCH
-    nop
-    PATCH_CODE dict_cstore, XCSTORE
-    nop
-    PATCH_CODE dict_plusstore, XPLUSSTORE
-    nop
-    PATCH_CODE dict_emit, XEMIT
-    nop
-    PATCH_CODE dict_key, XKEY
-    nop
-    PATCH_CODE dict_cr, XCR
-    nop
-    PATCH_CODE dict_dot, XDOT
-    nop
-    PATCH_CODE dict_udot, XUDOT
-    nop
-    PATCH_CODE dict_dots, XDOTS
-    nop
-    PATCH_CODE dict_type, XTYPE
-    nop
-    PATCH_CODE dict_state, XSTATE
-    nop
-    PATCH_CODE dict_base, XBASE
-    nop
-    PATCH_CODE dict_rbrack, XRBRA
-    nop
-    PATCH_CODE dict_lbrack, XLBRA
-    nop
-    PATCH_CODE dict_restart, XRESTART
-    nop
+    // --- counted name (uppercase), pad 8 ---
+    cmp x20, #255
+    b.ls 1f
+    mov x20, #255
+1:
+    strb w20, [x6], #1
+    mov x2, #0
+2:
+    cmp x2, x20
+    b.ge 3f
+    ldrb w3, [x19, x2]
+    // toupper
+    cmp w3, #'a'
+    b.lo 21f
+    cmp w3, #'z'
+    b.hi 21f
+    sub w3, w3, #32
+21:
+    strb w3, [x6], #1
+    add x2, x2, #1
+    b 2b
+3:
+    // pad name record to 8
+    sub x2, x6, x7                 // bytes written
+4:
+    tst x2, #7
+    b.eq 5f
+    strb wzr, [x6], #1
+    add x2, x2, #1
+    b 4b
+5:
+    // --- counted help, pad 8 ---
+    mov x8, x6                     // HFA start (not stored separately)
+    cmp x22, #255
+    b.ls 6f
+    mov x22, #255
+6:
+    strb w22, [x6], #1
+    mov x2, #0
+7:
+    cmp x2, x22
+    b.ge 8f
+    ldrb w3, [x21, x2]
+    strb w3, [x6], #1
+    add x2, x2, #1
+    b 7b
+8:
+    sub x2, x6, x8
+9:
+    tst x2, #7
+    b.eq 10f
+    strb wzr, [x6], #1
+    add x2, x2, #1
+    b 9b
+10:
+    // --- LFA: previous LATEST (CFA) ---
+    ldr x1, [x24]
+    str x1, [x6], #8
+    // --- FFA placeholder ---
+    str xzr, [x6], #8
+    // --- CFA: code ---
+    mov x0, x6                     // CFA
+    str x23, [x6], #8
+    // FLAGS = NFA_OFF | IMM
+    sub x1, x0, x7                 // NFA_OFF = CFA - NFA
+    ldr x5, [sp], #16              // imm
+    cbz x5, 11f
+    movz x2, #1
+    lsl x2, x2, #32                // FLAG_IMM
+    orr x1, x1, x2
+11:
+    str x1, [x0, #-8]              // store FLAGS at CFA-8
+    // HERE = CFA+8 (body)
+    adrp x2, here_ptr@page
+    add x2, x2, here_ptr@pageoff
+    str x6, [x2]
+    // LATEST = CFA
+    str x0, [x24]
+    // return CFA in x0
+    ldp x23, x24, [sp], #16
+    ldp x21, x22, [sp], #16
+    ldp x19, x20, [sp], #16
+    ldp x29, x30, [sp], #16
+    ret
 
-    // Patch new compilation primitives
-    PATCH_LINK dict_dp, dict_lbrack
-    nop
-    PATCH_LINK dict_here, dict_dp
-    nop
-    PATCH_LINK dict_alot, dict_here
-    nop
-    PATCH_LINK dict_comma, dict_alot
-    nop
-    PATCH_LINK dict_find, dict_comma
-    nop
-    PATCH_LINK dict_tick, dict_find
-    nop
-    PATCH_LINK dict_execute, dict_tick
-    nop
-    PATCH_LINK dict_literal, dict_execute
-    nop
-    PATCH_LINK dict_immediate, dict_literal
-    nop
-    PATCH_LINK dict_colon, dict_immediate
-    nop
-    PATCH_LINK dict_create, dict_colon
-    nop
-    PATCH_LINK dict_0branch, dict_create
-    nop
-    PATCH_LINK dict_branch, dict_0branch
-    nop
+// strlen: x0=zstr -> x0=len
+_strlen:
+    mov x1, x0
+    mov x0, #0
+1:
+    ldrb w2, [x1, x0]
+    cbz w2, 2f
+    add x0, x0, #1
+    b 1b
+2:
+    ret
 
-    PATCH_CODE dict_dp, XDP
-    nop
-    PATCH_CODE dict_here, XHERE
-    nop
-    PATCH_CODE dict_alot, XALLOT
-    nop
-    PATCH_CODE dict_comma, XCOMMA
-    nop
-    PATCH_CODE dict_find, XFIND
-    nop
-    PATCH_CODE dict_tick, XTICK
-    nop
-    PATCH_CODE dict_execute, XEXECUTE
-    nop
-    PATCH_CODE dict_literal, XLITERAL
-    nop
-    PATCH_CODE dict_immediate, XIMMEDIATE
-    nop
-    PATCH_CODE dict_colon, XCOLON
-    nop
-    PATCH_CODE dict_create, XCREATE
-    nop
-    PATCH_CODE dict_0branch, X0Branch
-    nop
-    PATCH_CODE dict_branch, XBranch
-    nop
-    PATCH_LINK dict_bye, dict_branch
-    nop
-    PATCH_CODE dict_bye, XBYE
-    nop
-    PATCH_LINK dict_include, dict_bye
-    nop
-    PATCH_CODE dict_include, XINCLUDE
-    nop
-    PATCH_LINK dict_latest, dict_include
-    nop
-    PATCH_CODE dict_latest, XLATEST
-    nop
-    PATCH_LINK dict_qdup, dict_latest
-    nop
-    PATCH_CODE dict_qdup, XQDUP
-    nop
-    PATCH_LINK dict_bracket_tick, dict_qdup
-    nop
-    PATCH_CODE dict_bracket_tick, XBRACKET_TICK
-    nop
-    PATCH_LINK dict_lit_addr, dict_bracket_tick
-    nop
-    PATCH_CODE dict_lit_addr, XLIT_ADDR
-    nop
-    PATCH_LINK dict_0br_addr, dict_lit_addr
-    nop
-    PATCH_CODE dict_0br_addr, X0BRANCH_ADDR
-    nop
-    PATCH_LINK dict_br_addr, dict_0br_addr
-    nop
-    PATCH_CODE dict_br_addr, XBRANCH_ADDR
-    nop
-    PATCH_LINK dict_exit_addr, dict_br_addr
-    nop
-    PATCH_CODE dict_exit_addr, XEXIT_ADDR
-    nop
+// _boot_kernel: walk boot_word_table, build headers, cache important CFAs
+_boot_kernel:
+    stp x29, x30, [sp, #-16]!
+    mov x29, sp
+    stp x19, x20, [sp, #-16]!
+    stp x21, x22, [sp, #-16]!
+    stp x23, x24, [sp, #-16]!
 
-    // ANS Core primitives (wired from existing code + new parse/comment)
-    PATCH_LINK dict_negate, dict_exit_addr
-    nop
-    PATCH_CODE dict_negate, XNEGATE
-    nop
-    PATCH_LINK dict_abs, dict_negate
-    nop
-    PATCH_CODE dict_abs, XABS
-    nop
-    PATCH_LINK dict_min, dict_abs
-    nop
-    PATCH_CODE dict_min, XMIN
-    nop
-    PATCH_LINK dict_max, dict_min
-    nop
-    PATCH_CODE dict_max, XMAX
-    nop
-    PATCH_LINK dict_lshift, dict_max
-    nop
-    PATCH_CODE dict_lshift, XLSHIFT
-    nop
-    PATCH_LINK dict_rshift, dict_lshift
-    nop
-    PATCH_CODE dict_rshift, XRSHIFT
-    nop
-    PATCH_LINK dict_nequal, dict_rshift
-    nop
-    PATCH_CODE dict_nequal, XNEQUAL
-    nop
-    PATCH_LINK dict_parse, dict_nequal
-    nop
-    PATCH_CODE dict_parse, XPARSE
-    nop
-    PATCH_LINK dict_word, dict_parse
-    nop
-    PATCH_CODE dict_word, XWORD
-    nop
-    PATCH_LINK dict_backslash, dict_word
-    nop
-    PATCH_CODE dict_backslash, XBACKSLASH
-    nop
-    PATCH_LINK dict_paren, dict_backslash
-    nop
-    PATCH_CODE dict_paren, XPAREN
-    nop
-    PATCH_LINK dict_docon_addr, dict_paren
-    nop
-    PATCH_CODE dict_docon_addr, XDOCON_ADDR
-    nop
-    PATCH_LINK dict_source, dict_docon_addr
-    nop
-    PATCH_CODE dict_source, XSOURCE
-    nop
-    PATCH_LINK dict_to_in, dict_source
-    nop
-    PATCH_CODE dict_to_in, XTOIN
-    nop
-    PATCH_LINK dict_slit, dict_to_in
-    nop
-    PATCH_CODE dict_slit, XSLIT
-    nop
-    PATCH_LINK dict_squote, dict_slit
-    nop
-    PATCH_CODE dict_squote, XSQUOTE
-    nop
-    PATCH_LINK dict_dotquote, dict_squote
-    nop
-    PATCH_CODE dict_dotquote, XDOTQ
-    nop
-    // DO LOOP family + DOES>
-    PATCH_LINK dict_do_rt, dict_dotquote
-    nop
-    PATCH_CODE dict_do_rt, XDO_RT
-    nop
-    PATCH_LINK dict_qdo_rt, dict_do_rt
-    nop
-    PATCH_CODE dict_qdo_rt, XQDO_RT
-    nop
-    PATCH_LINK dict_loop_rt, dict_qdo_rt
-    nop
-    PATCH_CODE dict_loop_rt, XLOOP_RT
-    nop
-    PATCH_LINK dict_ploop_rt, dict_loop_rt
-    nop
-    PATCH_CODE dict_ploop_rt, XPLUSLOOP_RT
-    nop
-    PATCH_LINK dict_i, dict_ploop_rt
-    nop
-    PATCH_CODE dict_i, XI
-    nop
-    PATCH_LINK dict_j, dict_i
-    nop
-    PATCH_CODE dict_j, XJ
-    nop
-    PATCH_LINK dict_unloop, dict_j
-    nop
-    PATCH_CODE dict_unloop, XUNLOOP
-    nop
-    PATCH_LINK dict_leave, dict_unloop
-    nop
-    PATCH_CODE dict_leave, XLEAVE
-    nop
-    PATCH_LINK dict_does_rt, dict_leave
-    nop
-    PATCH_CODE dict_does_rt, XDOES_RT
-    nop
-    PATCH_LINK dict_pad, dict_does_rt
-    nop
-    PATCH_CODE dict_pad, XPAD
-    nop
-    PATCH_LINK dict_does, dict_pad
-    nop
-    PATCH_CODE dict_does, XDOES
-    nop
-    PATCH_LINK dict_evaluate, dict_does
-    nop
-    PATCH_CODE dict_evaluate, XEVALUATE
-    nop
-    PATCH_LINK dict_catch, dict_evaluate
-    nop
-    PATCH_CODE dict_catch, XCATCH
-    nop
-    PATCH_LINK dict_throw, dict_catch
-    nop
-    PATCH_CODE dict_throw, XTHROW
-    nop
-    PATCH_LINK dict_catch_ok, dict_throw
-    nop
-    PATCH_CODE dict_catch_ok, XCATCH_OK
-    nop
-    PATCH_LINK dict_contains, dict_catch_ok
-    nop
-    PATCH_CODE dict_contains, XCONTAINS
-    nop
-    PATCH_LINK dict_msfetch, dict_contains
-    nop
-    PATCH_CODE dict_msfetch, XMSFETCH
-    nop
-    PATCH_LINK dict_unused, dict_msfetch
-    nop
-    PATCH_CODE dict_unused, XUNUSED
-    nop
-    PATCH_LINK dict_redef_warning, dict_unused
-    nop
-    PATCH_CODE dict_redef_warning, XREDEF_WARNING
-    nop
-    PATCH_LINK dict_user_dict, dict_redef_warning
-    nop
-    PATCH_CODE dict_user_dict, XUSER_DICT
-    nop
-    // SP0/SP@ for high-level DEPTH; SPACES C, S>D 2* 2/ 2@ 2!
-    PATCH_LINK dict_sp0, dict_user_dict
-    nop
-    PATCH_CODE dict_sp0, XSP0
-    nop
-    PATCH_LINK dict_spfetch, dict_sp0
-    nop
-    PATCH_CODE dict_spfetch, XSPFETCH
-    nop
-    PATCH_LINK dict_spstore, dict_spfetch
-    nop
-    PATCH_CODE dict_spstore, XSPSTORE
-    nop
-    PATCH_LINK dict_spaces, dict_spstore
-    nop
-    PATCH_CODE dict_spaces, XSPACES
-    nop
-    PATCH_LINK dict_ccomma, dict_spaces
-    nop
-    PATCH_CODE dict_ccomma, XCCOMMA
-    nop
-    PATCH_LINK dict_stod, dict_ccomma
-    nop
-    PATCH_CODE dict_stod, XSTOD
-    nop
-    PATCH_LINK dict_twostar, dict_stod
-    nop
-    PATCH_CODE dict_twostar, XTWOSTAR
-    nop
-    PATCH_LINK dict_twoslash, dict_twostar
-    nop
-    PATCH_CODE dict_twoslash, XTWOSLASH
-    nop
-    PATCH_LINK dict_twofetch, dict_twoslash
-    nop
-    PATCH_CODE dict_twofetch, XTWOFETCH
-    nop
-    PATCH_LINK dict_twostore, dict_twofetch
-    nop
-    PATCH_CODE dict_twostore, XTWOSTORE
-    nop
-    // Double-cell suite
-    PATCH_LINK dict_umstar, dict_twostore
-    nop
-    PATCH_CODE dict_umstar, XUMSTAR
-    nop
-    PATCH_LINK dict_mstar, dict_umstar
-    nop
-    PATCH_CODE dict_mstar, XMSTAR
-    nop
-    PATCH_LINK dict_ummod, dict_mstar
-    nop
-    PATCH_CODE dict_ummod, XUMMOD
-    nop
-    PATCH_LINK dict_smrem, dict_ummod
-    nop
-    PATCH_CODE dict_smrem, XSMREM
-    nop
-    PATCH_LINK dict_fmmod, dict_smrem
-    nop
-    PATCH_CODE dict_fmmod, XFMMOD
-    nop
-    PATCH_LINK dict_quit, dict_fmmod
-    nop
-    PATCH_CODE dict_quit, XQUIT
-    nop
-    // Group 3: SOURCE-ID REFILL ACCEPT >NUMBER ENVIRONMENT?
-    PATCH_LINK dict_source_id, dict_quit
-    nop
-    PATCH_CODE dict_source_id, XSOURCE_ID
-    nop
-    PATCH_LINK dict_refill, dict_source_id
-    nop
-    PATCH_CODE dict_refill, XREFILL
-    nop
-    PATCH_LINK dict_accept, dict_refill
-    nop
-    PATCH_CODE dict_accept, XACCEPT
-    nop
-    PATCH_LINK dict_to_number, dict_accept
-    nop
-    PATCH_CODE dict_to_number, XTONUMBER
-    nop
-    PATCH_LINK dict_environment_q, dict_to_number
-    nop
-    PATCH_CODE dict_environment_q, XENVIRONMENT_Q
-    nop
-    // FILE-ECHO ( -- addr )
-    PATCH_LINK dict_file_echo, dict_environment_q
-    nop
-    PATCH_CODE dict_file_echo, XFILE_ECHO
-    nop
-    // Core Ext CODE: 2>R 2R> 2R@ ROLL :NONAME (C") C" S\" SAVE/RESTORE-INPUT
-    PATCH_LINK dict_parse_name, dict_file_echo
-    nop
-    PATCH_CODE dict_parse_name, XPARSE_NAME
-    nop
-    PATCH_LINK dict_2tor, dict_parse_name
-    nop
-    PATCH_CODE dict_2tor, X2TOR
-    nop
-    PATCH_LINK dict_2rto, dict_2tor
-    nop
-    PATCH_CODE dict_2rto, X2RTO
-    nop
-    PATCH_LINK dict_2rfetch, dict_2rto
-    nop
-    PATCH_CODE dict_2rfetch, X2RFETCH
-    nop
-    PATCH_LINK dict_roll, dict_2rfetch
-    nop
-    PATCH_CODE dict_roll, XROLL
-    nop
-    PATCH_LINK dict_noname, dict_roll
-    nop
-    PATCH_CODE dict_noname, XNONAME
-    nop
-    PATCH_LINK dict_cstr, dict_noname
-    nop
-    PATCH_CODE dict_cstr, XCSTR
-    nop
-    PATCH_LINK dict_cquote, dict_cstr
-    nop
-    PATCH_CODE dict_cquote, XCQUOTE
-    nop
-    PATCH_LINK dict_sescape, dict_cquote
-    nop
-    PATCH_CODE dict_sescape, XSESCAPE
-    nop
-    PATCH_LINK dict_save_input, dict_sescape
-    nop
-    PATCH_CODE dict_save_input, XSAVE_INPUT
-    nop
-    PATCH_LINK dict_restore_input, dict_save_input
-    nop
-    PATCH_CODE dict_restore_input, XRESTORE_INPUT
-    nop
+    // boot_word_table rows: name*, help*, imm, code*  (code from BOOT_WORD ... XDUP)
+    adrp x19, boot_word_table@page
+    add x19, x19, boot_word_table@pageoff
+_bk_loop:
+    ldr x20, [x19], #8             // name ptr
+    cbz x20, _bk_done
+    ldr x21, [x19], #8             // help ptr
+    ldr x22, [x19], #8             // imm
+    ldr x4, [x19], #8              // code (e.g. XDUP)
+    // name len
+    mov x0, x20
+    bl _strlen
+    mov x1, x0                     // nlen
+    mov x0, x20                    // name
+    // help len
+    stp x0, x1, [sp, #-16]!
+    mov x0, x21
+    bl _strlen
+    mov x3, x0                     // hlen
+    ldp x0, x1, [sp], #16
+    mov x2, x21                    // help
+    // x4 = code already
+    mov x5, x22                    // imm
+    bl _header_build               // x0 = CFA
+    mov x21, x0                    // cfa for cache
+    mov x0, x20                    // name z
+    bl _boot_cache_cfa
+    b _bk_loop
+_bk_done:
+    // restart trampoline CFA cell
+    adrp x0, XRESTART@page
+    add x0, x0, XRESTART@pageoff
+    adrp x1, restart_cfa@page
+    add x1, x1, restart_cfa@pageoff
+    str x0, [x1]
+    adrp x0, restart_cell@page
+    add x0, x0, restart_cell@pageoff
+    adrp x1, restart_cfa@page
+    add x1, x1, restart_cfa@pageoff
+    str x1, [x0]
 
-    .purgem PATCH_CODE
-    .purgem PATCH_LINK
+    ldp x23, x24, [sp], #16
+    ldp x21, x22, [sp], #16
+    ldp x19, x20, [sp], #16
+    ldp x29, x30, [sp], #16
+    ret
+
+// _boot_cache_cfa: x0 = name C string, x21 = cfa
+// Fills cfa_* cells for names needed by the assembler.
+_boot_cache_cfa:
+    stp x29, x30, [sp, #-16]!
+    stp x19, x20, [sp, #-16]!
+    mov x19, x0                    // name
+    mov x20, x21                   // cfa
+    // LIT
+    adrp x1, boot_cmp_lit@page
+    add x1, x1, boot_cmp_lit@pageoff
+    bl _zcmp
+    cbnz x0, 1f
+    adrp x2, cfa_lit@page
+    add x2, x2, cfa_lit@pageoff
+    str x20, [x2]
+    b 9f
+1:  mov x0, x19
+    adrp x1, boot_cmp_exit@page
+    add x1, x1, boot_cmp_exit@pageoff
+    bl _zcmp
+    cbnz x0, 2f
+    adrp x2, cfa_exit@page
+    add x2, x2, cfa_exit@pageoff
+    str x20, [x2]
+    b 9f
+2:  mov x0, x19
+    adrp x1, boot_cmp_slit@page
+    add x1, x1, boot_cmp_slit@pageoff
+    bl _zcmp
+    cbnz x0, 3f
+    adrp x2, cfa_slit@page
+    add x2, x2, cfa_slit@pageoff
+    str x20, [x2]
+    b 9f
+3:  mov x0, x19
+    adrp x1, boot_cmp_cstr@page
+    add x1, x1, boot_cmp_cstr@pageoff
+    bl _zcmp
+    cbnz x0, 4f
+    adrp x2, cfa_cstr@page
+    add x2, x2, cfa_cstr@pageoff
+    str x20, [x2]
+    b 9f
+4:  mov x0, x19
+    adrp x1, boot_cmp_type@page
+    add x1, x1, boot_cmp_type@pageoff
+    bl _zcmp
+    cbnz x0, 5f
+    adrp x2, cfa_type@page
+    add x2, x2, cfa_type@pageoff
+    str x20, [x2]
+    b 9f
+5:  mov x0, x19
+    adrp x1, boot_cmp_branch@page
+    add x1, x1, boot_cmp_branch@pageoff
+    bl _zcmp
+    cbnz x0, 6f
+    adrp x2, cfa_branch@page
+    add x2, x2, cfa_branch@pageoff
+    str x20, [x2]
+    b 9f
+6:  mov x0, x19
+    adrp x1, boot_cmp_0branch@page
+    add x1, x1, boot_cmp_0branch@pageoff
+    bl _zcmp
+    cbnz x0, 7f
+    adrp x2, cfa_0branch@page
+    add x2, x2, cfa_0branch@pageoff
+    str x20, [x2]
+    b 9f
+7:  mov x0, x19
+    adrp x1, boot_cmp_does_rt@page
+    add x1, x1, boot_cmp_does_rt@pageoff
+    bl _zcmp
+    cbnz x0, 8f
+    adrp x2, cfa_does_rt@page
+    add x2, x2, cfa_does_rt@pageoff
+    str x20, [x2]
+    b 9f
+8:  mov x0, x19
+    adrp x1, boot_cmp_catch_ok@page
+    add x1, x1, boot_cmp_catch_ok@pageoff
+    bl _zcmp
+    cbnz x0, 9f
+    adrp x2, cfa_catch_ok@page
+    add x2, x2, cfa_catch_ok@pageoff
+    str x20, [x2]
+9:
+    ldp x19, x20, [sp], #16
+    ldp x29, x30, [sp], #16
+    ret
+
+// _zcmp: x0=a, x1=b -> x0=0 if equal
+_zcmp:
+1:
+    ldrb w2, [x0], #1
+    ldrb w3, [x1], #1
+    cmp w2, w3
+    b.ne 2f
+    cbnz w2, 1b
+    mov x0, #0
+    ret
+2:
+    mov x0, #1
     ret
 
 // ============================================================================
@@ -1398,13 +1065,14 @@ XFIND:
     add x0, x2, #1              // address of name chars
     bl _find_word
     cbz x0, _xfind_not
-    // x0 = entry; reload flags (x1 may be ok from _find_word)
-    ldr x1, [x0, #8]
-    tst x1, #0x100
+    // x0 = CFA, x1 = FLAGS
+    movz x2, #1
+    lsl x2, x2, #32             // FLAG_IMM
+    tst x1, x2
     mov x4, #1
     mov x5, #-1
     csel x4, x4, x5, ne         // immediate -> 1, else -1
-    mov x20, x0                 // xt
+    mov x20, x0                 // xt = CFA
     str x20, [x22, #-8]!
     mov x20, x4                 // flag
     NEXT
@@ -1413,18 +1081,16 @@ _xfind_not:
     mov x20, #0
     NEXT
 
-// ' ( "name" -- xt ) tick: find word and push dictionary entry (XT)
-// XT is the dict entry address; DOCOL/native words all expect x21 = entry.
+// ' ( "name" -- xt )  xt = CFA
 XTICK:
     bl _next_word
     cbz x1, _tick_fail
     bl _find_word
     cbz x0, _tick_fail
     DPUSH
-    mov x20, x0         // push entry address (XT)
+    mov x20, x0                 // CFA
     NEXT
 _tick_fail:
-    // Print "?" and abort
     mov x0, #1
     adrp x1, str_quest@page
     add x1, x1, str_quest@pageoff
@@ -1433,15 +1099,11 @@ _tick_fail:
     svc #0x80
     b _do_quit
 
-// EXECUTE ( xt -- ) execute a dictionary entry and return to caller.
-// Must NOT force the interpret trampoline: when EXECUTE is used inside a
-// colon definition (e.g. ELAPSED), IP already points at the next cell and
-// DOCOL/NEXT/EXIT nest correctly. Interpret-time EXECUTE still returns via
-// the existing restart_cell IP set up by _exec_found.
+// EXECUTE ( xt -- )  xt = CFA
 XEXECUTE:
-    mov x21, x20                   // W = xt (dict entry)
-    ldr x20, [x22], #8             // pop xt → prior TOS
-    ldr x1, [x21, #16]             // code field
+    mov x21, x20                   // W = CFA
+    ldr x20, [x22], #8
+    ldr x1, [x21]                  // code at CFA
     br x1
 
 // LITERAL ( x -- ) immediate: compile LIT + value
@@ -1449,8 +1111,9 @@ XLITERAL:
     // Save TOS value (bl will clobber x0-x3)
     str x20, [x23, #-8]!
     // Compile LIT entry address
-    adrp x0, dict_lit@page
-    add x0, x0, dict_lit@pageoff
+    adrp x0, cfa_lit@page
+    add x0, x0, cfa_lit@pageoff
+    ldr x0, [x0]
     bl _compile_cell
     // Compile the literal value
     ldr x0, [x23], #8
@@ -1459,19 +1122,19 @@ XLITERAL:
 
 // IMMEDIATE ( -- ) mark last defined word as immediate
 XIMMEDIATE:
-    ldr x0, [x24]       // x0 = address of last defined word
-    ldr x1, [x0, #8]    // load flags|len
-    orr x1, x1, #0x100  // set immediate bit
-    str x1, [x0, #8]
+    ldr x0, [x24]                  // CFA of latest
+    ldr x1, [x0, #-8]              // FLAGS
+    movz x2, #1
+    lsl x2, x2, #32                // FLAG_IMM
+    orr x1, x1, x2
+    str x1, [x0, #-8]
     NEXT
 
 // : ( "name" -- ) start colon definition
 XCOLON:
-    // Not a :NONAME definition
     adrp x0, noname_xt@page
     add x0, x0, noname_xt@pageoff
     str xzr, [x0]
-    // Save VM state and frame
     stp x29, x30, [sp, #-16]!
     mov x29, sp
     stp x19, x20, [sp, #-16]!
@@ -1479,66 +1142,26 @@ XCOLON:
     stp x23, x24, [sp, #-16]!
     bl _next_word
     cbz x1, _colon_fail
-    // x0 = word addr, x1 = word len
-    mov x19, x0          // save word addr
-    mov x20, x1          // save word len
-    // Warn if this name already exists in the dictionary
+    mov x19, x0
+    mov x20, x1
     mov x0, x19
     mov x1, x20
     bl _warn_redef
-
-    // Get current HERE = new entry address
-    adrp x0, here_ptr@page
-    add x0, x0, here_ptr@pageoff
-    ldr x0, [x0]
-    mov x21, x0          // x21 = new entry
-
-    // Write link = *x24 (previous latest)
-    ldr x1, [x24]
-    str x1, [x0], #8
-
-    // Write flags|len = len
-    str x20, [x0], #8
-
-    // Write code_field = DOCOL
-    adrp x1, DOCOL@page
-    add x1, x1, DOCOL@pageoff
-    str x1, [x0], #8
-
-    // Copy name (x19) with length x20, pad to 8 bytes
-    mov x2, #0
-_colon_name_loop:
-    cmp x2, x20
-    b.ge _colon_name_pad
-    ldrb w3, [x19, x2]
-    strb w3, [x0, x2]
-    add x2, x2, #1
-    b _colon_name_loop
-_colon_name_pad:
-    mov w3, #0
-_colon_pad_loop:
-    tst x2, #7
-    b.eq _colon_name_done
-    strb w3, [x0, x2]
-    add x2, x2, #1
-    b _colon_pad_loop
-_colon_name_done:
-    add x0, x0, x2
-
-    // Update HERE
-    adrp x1, here_ptr@page
-    add x1, x1, here_ptr@pageoff
-    str x0, [x1]
-
-    // Update latest (x24) to new entry
-    str x21, [x24]
-
-    // Set state to compile mode
+    // name x19/x20, empty help, code=DOCOL, imm=0
+    mov x0, x19
+    mov x1, x20
+    adrp x2, boot_h_empty@page
+    add x2, x2, boot_h_empty@pageoff
+    mov x3, #0
+    adrp x4, DOCOL@page
+    add x4, x4, DOCOL@pageoff
+    mov x5, #0
+    bl _header_build               // CFA; HERE = body
+    // compile mode
     adrp x0, state_var@page
     add x0, x0, state_var@pageoff
     mov x1, #1
     str x1, [x0]
-    // Restore VM state
     ldp x23, x24, [sp], #16
     ldp x21, x22, [sp], #16
     ldp x19, x20, [sp], #16
@@ -1551,39 +1174,34 @@ _colon_fail:
     mov x2, #2
     mov x16, #4
     svc #0x80
-    // Restore VM state and bail to QUIT
     ldp x23, x24, [sp], #16
     ldp x21, x22, [sp], #16
     ldp x19, x20, [sp], #16
     ldp x29, x30, [sp], #16
     b _do_quit
 
+// :NONAME
 // :NONAME ( -- ) start nameless colon definition; ; leaves xt
 XNONAME:
-    // Create DOCOL entry with empty name at HERE
-    adrp x0, here_ptr@page
-    add x0, x0, here_ptr@pageoff
-    ldr x0, [x0]
-    mov x1, x0                     // new entry
-    // link
-    ldr x2, [x24]
-    str x2, [x0], #8
-    // flags|len = 0
-    str xzr, [x0], #8
-    // code = DOCOL
-    adrp x2, DOCOL@page
-    add x2, x2, DOCOL@pageoff
-    str x2, [x0], #8
-    // name length 0 — body begins here (already 8-aligned after code field)
-    adrp x2, here_ptr@page
-    add x2, x2, here_ptr@pageoff
-    str x0, [x2]
-    str x1, [x24]                  // LATEST = new entry
-    // remember for ; to push xt
-    adrp x2, noname_xt@page
-    add x2, x2, noname_xt@pageoff
-    str x1, [x2]
-    // compile mode
+    // empty name + empty help + DOCOL
+    adrp x0, boot_h_empty@page
+    add x0, x0, boot_h_empty@pageoff
+    mov x1, #0                     // nlen 0 — use empty string
+    // name ptr can be empty cstr
+    mov x0, x0                     // name = ""
+    mov x1, #0
+    mov x2, x0                     // help = ""
+    mov x3, #0
+    adrp x4, DOCOL@page
+    add x4, x4, DOCOL@pageoff
+    mov x5, #0
+    stp x29, x30, [sp, #-16]!
+    bl _header_build
+    ldp x29, x30, [sp], #16
+    // remember CFA for ;
+    adrp x1, noname_xt@page
+    add x1, x1, noname_xt@pageoff
+    str x0, [x1]
     adrp x0, state_var@page
     add x0, x0, state_var@pageoff
     mov x1, #1
@@ -1593,8 +1211,9 @@ XNONAME:
 // ; ( -- ) immediate: end colon definition; after :NONAME leaves xt
 XSEMI:
     // Compile EXIT entry address
-    adrp x0, dict_exit@page
-    add x0, x0, dict_exit@pageoff
+    adrp x0, cfa_exit@page
+    add x0, x0, cfa_exit@pageoff
+    ldr x0, [x0]
     bl _compile_cell
     // Set state to interpret mode
     adrp x0, state_var@page
@@ -1611,7 +1230,7 @@ XSEMI:
 _semi_done:
     NEXT
 
-// CREATE ( "name" -- ) create dictionary entry with DOVAR code field
+// CREATE ( "name" -- ) header with DOVAR; does_ip at CFA+8, PFA at CFA+16
 XCREATE:
     stp x29, x30, [sp, #-16]!
     mov x29, sp
@@ -1622,52 +1241,24 @@ XCREATE:
     cbz x1, _create_fail
     mov x19, x0
     mov x20, x1
-    // Warn if this name already exists
     mov x0, x19
     mov x1, x20
     bl _warn_redef
-    // Get current HERE = new entry address
-    adrp x0, here_ptr@page
-    add x0, x0, here_ptr@pageoff
-    ldr x0, [x0]
-    mov x21, x0
-    // Write link
-    ldr x1, [x24]
-    str x1, [x0], #8
-    // Write flags|len
-    str x20, [x0], #8
-    // Write code_field = DOVAR
-    adrp x1, DOVAR@page
-    add x1, x1, DOVAR@pageoff
-    str x1, [x0], #8
-    // Copy name
-    mov x2, #0
-_create_name_loop:
-    cmp x2, x20
-    b.ge _create_name_pad
-    ldrb w3, [x19, x2]
-    strb w3, [x0, x2]
-    add x2, x2, #1
-    b _create_name_loop
-_create_name_pad:
-    mov w3, #0
-_create_pad_loop:
-    tst x2, #7
-    b.eq _create_name_done
-    strb w3, [x0, x2]
-    add x2, x2, #1
-    b _create_pad_loop
-_create_name_done:
-    add x0, x0, x2
-    // Reserve does_ip cell at body+0; user PFA starts at body+8
-    str xzr, [x0], #8
-    // Update HERE
+    mov x0, x19
+    mov x1, x20
+    adrp x2, boot_h_empty@page
+    add x2, x2, boot_h_empty@pageoff
+    mov x3, #0
+    adrp x4, DOVAR@page
+    add x4, x4, DOVAR@pageoff
+    mov x5, #0
+    bl _header_build               // HERE = CFA+8
+    // reserve does_ip cell (0); user PFA follows
     adrp x1, here_ptr@page
     add x1, x1, here_ptr@pageoff
+    ldr x0, [x1]
+    str xzr, [x0], #8
     str x0, [x1]
-    // Update latest
-    str x21, [x24]
-    // Restore VM state
     ldp x23, x24, [sp], #16
     ldp x21, x22, [sp], #16
     ldp x19, x20, [sp], #16
@@ -1839,8 +1430,9 @@ XBRACKET_TICK:
     // x0 = entry address
     mov x19, x0
     // Compile LIT entry address
-    adrp x0, dict_lit@page
-    add x0, x0, dict_lit@pageoff
+    adrp x0, cfa_lit@page
+    add x0, x0, cfa_lit@pageoff
+    ldr x0, [x0]
     bl _compile_cell
     // Compile the entry address
     mov x0, x19
@@ -1872,32 +1464,36 @@ _bracket_tick_fail:
 // LIT-ADDR ( -- addr ) push dict_lit entry address
 XLIT_ADDR:
     DPUSH
-    adrp x0, dict_lit@page
-    add x0, x0, dict_lit@pageoff
+    adrp x0, cfa_lit@page
+    add x0, x0, cfa_lit@pageoff
+    ldr x0, [x0]
     mov x20, x0
     NEXT
 
 // 0BRANCH-ADDR ( -- addr ) push dict_0branch entry address
 X0BRANCH_ADDR:
     DPUSH
-    adrp x0, dict_0branch@page
-    add x0, x0, dict_0branch@pageoff
+    adrp x0, cfa_0branch@page
+    add x0, x0, cfa_0branch@pageoff
+    ldr x0, [x0]
     mov x20, x0
     NEXT
 
 // BRANCH-ADDR ( -- addr ) push dict_branch entry address
 XBRANCH_ADDR:
     DPUSH
-    adrp x0, dict_branch@page
-    add x0, x0, dict_branch@pageoff
+    adrp x0, cfa_branch@page
+    add x0, x0, cfa_branch@pageoff
+    ldr x0, [x0]
     mov x20, x0
     NEXT
 
 // EXIT-ADDR ( -- addr ) push dict_exit entry address
 XEXIT_ADDR:
     DPUSH
-    adrp x0, dict_exit@page
-    add x0, x0, dict_exit@pageoff
+    adrp x0, cfa_exit@page
+    add x0, x0, cfa_exit@pageoff
+    ldr x0, [x0]
     mov x20, x0
     NEXT
 
@@ -2015,21 +1611,19 @@ XLEAVE:
 
 // (DOES>) ( -- ) runtime of DOES>: patch LATEST, then EXIT defining word
 XDOES_RT:
-    ldr x0, [x24]                  // latest entry
+    ldr x0, [x24]                  // latest CFA
     adrp x1, DODOES@page
     add x1, x1, DODOES@pageoff
-    str x1, [x0, #16]              // code field = DODOES
-    // body[0] = does_ip (x19 points at first word of does-clause)
-    DICT_BODY_ADDR x1, x0
-    str x19, [x1]
-    // EXIT defining word
+    str x1, [x0]                   // CODE at CFA = DODOES
+    str x19, [x0, #8]              // does_ip at CFA+8
     RPOP
     NEXT
 
 // DOES> ( -- ) IMMEDIATE  compile (DOES>)
 XDOES:
-    adrp x0, dict_does_rt@page
-    add x0, x0, dict_does_rt@pageoff
+    adrp x0, cfa_does_rt@page
+    add x0, x0, cfa_does_rt@pageoff
+    ldr x0, [x0]
     bl _compile_cell
     NEXT
 
@@ -2065,7 +1659,7 @@ XMSFETCH:
     NEXT
 
 // UNUSED ( -- u )  free bytes remaining in user_dict_area (128 KiB)
-.equ USER_DICT_SIZE, 131072
+.equ USER_DICT_SIZE, 262144  // 256 KiB (was 128 KiB; +room for names/comments)
 XUNUSED:
     adrp x0, here_ptr@page
     add x0, x0, here_ptr@pageoff
@@ -2469,8 +2063,9 @@ XCATCH:
     str x19, [x23, #-8]!           // saved_IP (resume after CATCH)
     str x23, [x7]                  // handler = &saved_IP
     // Return trampoline: NEXT after xt → catch_ok entry
-    adrp x0, dict_catch_ok@page
-    add x0, x0, dict_catch_ok@pageoff
+    adrp x0, cfa_catch_ok@page
+    add x0, x0, cfa_catch_ok@pageoff
+    ldr x0, [x0]
     adrp x1, catch_ok_cell@page
     add x1, x1, catch_ok_cell@pageoff
     str x0, [x1]
@@ -3100,8 +2695,9 @@ _sq_comp:
     str x19, [x23, #-8]!            // RPUSH IP
     str x2, [x23, #-8]!             // save c-addr
     str x5, [x23, #-8]!             // save u
-    adrp x0, dict_slit@page
-    add x0, x0, dict_slit@pageoff
+    adrp x0, cfa_slit@page
+    add x0, x0, cfa_slit@pageoff
+    ldr x0, [x0]
     bl _compile_cell
     ldr x0, [x23]                   // peek u
     bl _compile_cell
@@ -3220,8 +2816,9 @@ _cq_comp:
     str x19, [x23, #-8]!
     str x2, [x23, #-8]!
     str x5, [x23, #-8]!
-    adrp x0, dict_cstr@page
-    add x0, x0, dict_cstr@pageoff
+    adrp x0, cfa_cstr@page
+    add x0, x0, cfa_cstr@pageoff
+    ldr x0, [x0]
     bl _compile_cell
     ldr x5, [x23], #8
     ldr x2, [x23], #8
@@ -3433,8 +3030,9 @@ _se_comp:
     str x19, [x23, #-8]!
     str x7, [x23, #-8]!            // buf
     str x5, [x23, #-8]!            // u
-    adrp x0, dict_slit@page
-    add x0, x0, dict_slit@pageoff
+    adrp x0, cfa_slit@page
+    add x0, x0, cfa_slit@pageoff
+    ldr x0, [x0]
     bl _compile_cell
     ldr x0, [x23]                  // peek u
     bl _compile_cell
@@ -3599,8 +3197,9 @@ _dq_comp:
     str x19, [x23, #-8]!
     str x2, [x23, #-8]!
     str x5, [x23, #-8]!
-    adrp x0, dict_slit@page
-    add x0, x0, dict_slit@pageoff
+    adrp x0, cfa_slit@page
+    add x0, x0, cfa_slit@pageoff
+    ldr x0, [x0]
     bl _compile_cell
     ldr x0, [x23]
     bl _compile_cell
@@ -3624,8 +3223,9 @@ _dq_al:
     adrp x0, here_ptr@page
     add x0, x0, here_ptr@pageoff
     str x1, [x0]
-    adrp x0, dict_type@page
-    add x0, x0, dict_type@pageoff
+    adrp x0, cfa_type@page
+    add x0, x0, cfa_type@pageoff
+    ldr x0, [x0]
     bl _compile_cell
     ldr x19, [x23], #8
     NEXT
@@ -3702,8 +3302,9 @@ _compile_slit:
     stp x21, x22, [sp, #-16]!
     mov x19, x2                     // src
     mov x20, x5                     // len
-    adrp x0, dict_slit@page
-    add x0, x0, dict_slit@pageoff
+    adrp x0, cfa_slit@page
+    add x0, x0, cfa_slit@pageoff
+    ldr x0, [x0]
     bl _compile_cell
     mov x0, x20
     bl _compile_cell
@@ -3872,8 +3473,9 @@ _compile_lit:
     // Save value on return stack (bl will clobber x0-x3)
     str x1, [x23, #-8]!
     // Compile LIT entry address
-    adrp x0, dict_lit@page
-    add x0, x0, dict_lit@pageoff
+    adrp x0, cfa_lit@page
+    add x0, x0, cfa_lit@pageoff
+    ldr x0, [x0]
     bl _compile_cell
     // Compile the literal value
     ldr x0, [x23], #8
@@ -3887,13 +3489,14 @@ _try_find:
     bl _find_word
     cbz x0, _word_not_found
 
-    mov x2, x0
-    mov x3, x1
+    mov x2, x0                     // CFA
+    mov x3, x1                     // FLAGS
+    ldr x5, [x2]                   // code ptr at CFA
 
-    ldr x5, [x2, #16]
-
-    // Immediate?
-    tst x3, #0x100
+    // Immediate? FLAG_IMM bit 32
+    movz x4, #1
+    lsl x4, x4, #32
+    tst x3, x4
     b.ne _exec_found
 
     // Compile mode?
@@ -3903,27 +3506,16 @@ _try_find:
     cbnz x6, _compile_entry
 
 _exec_found:
-    // Compute dict_restart address at runtime (avoids broken .quad relocation)
-    adrp x19, dict_restart@page
-    add  x19, x19, dict_restart@pageoff
-    // Compute XRESTART address and store in dict_restart+16 (code field)
-    adrp x1, XRESTART@page
-    add  x1, x1, XRESTART@pageoff
-    str  x1, [x19, #16]
-    // Store dict_restart address in restart_cell
-    adrp x1, restart_cell@page
-    add  x1, x1, restart_cell@pageoff
-    str  x19, [x1]
-    // Set x19 to point to restart_cell (IP register for NEXT)
-    mov  x19, x1
+    // Trampoline: IP -> restart_cell -> restart_cfa (code = XRESTART)
+    adrp x19, restart_cell@page
+    add  x19, x19, restart_cell@pageoff
     mov x21, x2
-    // Crash diagnostic: save x5 (code field ptr), dict_restart addr, XRESTART addr to next_diag
     adrp x1, next_diag@page
     add  x1, x1, next_diag@pageoff
-    str  x5, [x1]             // next_diag+0 = code field value
-    str  x19, [x1, #8]        // next_diag+8 = restart_cell ptr (x19 after mov)
-    str  x22, [x1, #16]       // next_diag+16 = DSP (x22)
-    str  x20, [x1, #24]       // next_diag+24 = TOS (x20)
+    str  x5, [x1]
+    str  x19, [x1, #8]
+    str  x22, [x1, #16]
+    str  x20, [x1, #24]
     br x5
 
 _compile_entry:
@@ -5220,34 +4812,34 @@ _pn_fail:
     ldp x29, x30, [sp], #16
     ret
 
-// _find_word: x0=addr, x1=len -> x0=entry or 0, x1=flags
+// _find_word: x0=addr, x1=len -> x0=CFA or 0, x1=FLAGS (bit32=IMM)
 _find_word:
     stp x29, x30, [sp, #-16]!
     mov x29, sp
     stp x19, x20, [sp, #-16]!
     stp x21, x22, [sp, #-16]!
-    mov x19, x0
-    mov x20, x1
-    ldr x21, [x24]          // start at latest dict entry (*latest_var)
+    mov x19, x0                    // search name
+    mov x20, x1                    // len
+    ldr x21, [x24]                 // latest CFA
 _fw_loop:
     cbz x21, _fw_fail
-    ldr x2, [x21, #8]
-    and x3, x2, #0xFF
+    ldr x2, [x21, #-8]             // FLAGS
+    and x3, x2, #0xFFFFFFFF        // NFA_OFF
+    sub x4, x21, x3                // NFA
+    ldrb w3, [x4], #1              // name len; x4 -> chars
     cmp x3, x20
     b.ne _fw_next
-    add x4, x21, #24
     mov x5, #0
 _fw_cmp:
     cmp x5, x20
     b.ge _fw_match
     ldrb w6, [x4, x5]
     ldrb w7, [x19, x5]
-    cmp w6, #97
-    b.lo _fw_ch
-    sub w6, w6, #32
-_fw_ch:
-    cmp w7, #97
+    // names in dict are uppercase; still fold search char
+    cmp w7, #'a'
     b.lo _fw_eq
+    cmp w7, #'z'
+    b.hi _fw_eq
     sub w7, w7, #32
 _fw_eq:
     cmp w6, w7
@@ -5255,14 +4847,14 @@ _fw_eq:
     add x5, x5, #1
     b _fw_cmp
 _fw_match:
-    mov x0, x21
-    ldr x1, [x21, #8]
+    mov x0, x21                    // CFA
+    ldr x1, [x21, #-8]             // FLAGS
     ldp x21, x22, [sp], #16
     ldp x19, x20, [sp], #16
     ldp x29, x30, [sp], #16
     ret
 _fw_next:
-    ldr x21, [x21]
+    ldr x21, [x21, #-16]           // LINK at CFA-16
     b _fw_loop
 _fw_fail:
     mov x0, #0
@@ -5599,7 +5191,7 @@ env_n_maxu:     .asciz "MAX-U"
 env_n_rstack:   .asciz "RETURN-STACK-CELLS"
 env_n_stack:    .asciz "STACK-CELLS"
 
-str_hello:  .asciz "PickleForth v0.2.0\n"
+str_hello:  .asciz "PickleForth v0.3.0\n"
 str_prompt: .asciz "\nok> "
 str_ok:     .asciz " ok\n"
 str_bye:    .asciz "Bye!\n"
@@ -5621,22 +5213,12 @@ str_x:      .asciz "X"
 // High-level Forth bootstrap (interpreted once at startup)
 // Prefer new user-facing words here; assembly only for needed primitives.
 //
-// Dictionary field helpers (xt = entry address from ' or FIND):
-//   >LINK  ( xt -- a-addr )  link field (previous word); offset 0
-//   >FLAGS ( xt -- a-addr )  flags|length cell; offset 8
-//   >CODE  ( xt -- a-addr )  code field address; offset 16  (was bare "16 +")
-//   >NAME  ( xt -- a-addr )  first name byte; offset 24
-//   >BODY  ( xt -- a-addr )  body/parameter field after aligned name
-//
-// Control-flow compilers (immediate):
-//   BEGIN  ( -- dest )              mark begin for AGAIN/UNTIL/WHILE
-//   UNTIL  ( dest -- )              compile 0BRANCH back to dest
-//   AGAIN  ( dest -- )              compile BRANCH back to dest
-//   IF     ( -- orig )              compile 0BRANCH + placeholder
-//   THEN   ( orig -- )              resolve forward branch
-//   ELSE   ( orig1 -- orig2 )       branch around false part, resolve IF
-//   WHILE  ( dest -- orig dest )    0BRANCH out of BEGIN loop
-//   REPEAT ( orig dest -- )         BRANCH to dest, resolve WHILE
+// Dictionary field helpers (xt = CFA from ' or FIND):
+//   >LINK  ( xt -- a-addr )  LINK at CFA-16
+//   >FLAGS ( xt -- a-addr )  FLAGS at CFA-8  (low32=NFA_OFF, bit32=IMM)
+//   >CODE  ( xt -- a-addr )  CFA itself (code field)
+//   >BODY  ( xt -- a-addr )  CFA+8
+//   NAME>STRING via NFA = CFA - NFA_OFF
 // ============================================================================
 forth_init_str:
     // Order matters: define dependencies before users.
@@ -5644,7 +5226,7 @@ forth_init_str:
     // HERE as DP @ (shadows CODE HERE so SEE shows the classic definition)
     .ascii ": HERE DP @ ; "
 
-    // --- 1. Simple ANS helpers (no control flow, no >CODE) ---
+    // --- 1. Simple ANS helpers ---
     .ascii ": BL 32 ; "
     .ascii ": SPACE BL EMIT ; "
     .ascii ": CHAR+ 1+ ; "
@@ -5667,13 +5249,13 @@ forth_init_str:
     .ascii ": <= > 0= ; "
     .ascii ": WITHIN OVER - >R - R> U< ; "
 
-    // --- 2. Dictionary field accessors (needed by CONSTANT, ALIAS, SEE) ---
-    .ascii ": >LINK ; "
-    .ascii ": >FLAGS 8 + ; "
-    .ascii ": >CODE 16 + ; "
-    .ascii ": >NAME 24 + ; "
-    .ascii ": NAME>STRING DUP >NAME SWAP >FLAGS @ 255 AND ; "
-    .ascii ": >BODY NAME>STRING ALIGNED + ; "
+    // --- 2. Dictionary field accessors (xt = CFA) ---
+    .ascii ": >LINK 16 - ; "
+    .ascii ": >FLAGS 8 - ; "
+    .ascii ": >CODE ; "
+    .ascii ": >BODY 8 + ; "
+    // NFA = CFA - (FLAGS & 0xFFFFFFFF); NAME>STRING = COUNT at NFA
+    .ascii ": NAME>STRING DUP >FLAGS @ 4294967295 AND - COUNT ; "
 
     // --- 3. Control flow (immediate) ---
     .ascii ": BEGIN HERE ; IMMEDIATE "
@@ -5738,12 +5320,12 @@ forth_init_str:
     // WORDS [string]  list all names, or only those containing string (case-insensitive).
     // Keep filter (fa fu) under the walk: >R / 2DUP / R@ NAME>STRING / 2SWAP so CONTAINS
     // does not consume the filter (previous ROT >R 2SWAP path ate fa fu on first match check).
-    .ascii ": WORDS BL WORD COUNT LATEST @ BEGIN DUP WHILE >R 2DUP R@ NAME>STRING 2SWAP CONTAINS IF R@ NAME>STRING TYPE SPACE THEN R> @ REPEAT DROP 2DROP CR ; "
-    .ascii ": DOCOL? >CODE @ ['] WORDS >CODE @ = ; "
+    .ascii ": WORDS BL WORD COUNT LATEST @ BEGIN DUP WHILE >R 2DUP R@ NAME>STRING 2SWAP CONTAINS IF R@ NAME>STRING TYPE SPACE THEN R> >LINK @ REPEAT DROP 2DROP CR ; "
+    .ascii ": DOCOL? @ ['] WORDS @ = ; "
     // SEE: walk colon body; skip inline data after LIT, (S"), BRANCH, 0BRANCH,
     // (LOOP), and (+LOOP). Ordinary xts (including (DO), (DOES>), EXIT) are 1 cell.
     .ascii ": SEE ' DUP DOCOL? IF 58 EMIT SPACE ELSE 67 EMIT 79 EMIT 68 EMIT 69 EMIT SPACE THEN DUP NAME>STRING TYPE SPACE DUP DOCOL? 0= IF DROP 40 EMIT 112 EMIT 114 EMIT 105 EMIT 109 EMIT 105 EMIT 116 EMIT 105 EMIT 118 EMIT 101 EMIT 41 EMIT CR EXIT THEN >BODY BEGIN DUP @ DUP EXIT-ADDR = IF 2DROP 59 EMIT CR EXIT THEN DUP LIT-ADDR = IF DROP 8 + DUP @ . 8 + ELSE DUP ['] (S\") = IF DROP 8 + DUP @ >R 8 + 83 EMIT 34 EMIT SPACE DUP R@ TYPE 34 EMIT SPACE R> + ALIGNED ELSE DUP NAME>STRING TYPE SPACE DUP BRANCH-ADDR = OVER 0BRANCH-ADDR = OR OVER ['] (LOOP) = OR OVER ['] (+LOOP) = OR IF DROP 8 + DUP @ . SPACE 8 + ELSE DROP 8 + THEN THEN THEN AGAIN ; "
-    .ascii ": ALIAS CREATE LATEST @ >CODE SWAP >CODE @ SWAP ! ; "
+    .ascii ": ALIAS CREATE LATEST @ SWAP @ SWAP ! ; "
     .ascii "' INCLUDE ALIAS FLOAD "
     // .FREE ( -- )  print free user-dictionary bytes (UNUSED is the cell value)
     .ascii ": .FREE UNUSED U. SPACE S\" bytes free\" TYPE CR ; "
@@ -5774,10 +5356,9 @@ forth_init_str:
     // FORGET <name>  remove name and all newer words; rewind HERE to name's header.
     // FIND leaves (c-addr 0|xt flag); 0= IF consumes flag — do not DROP xt after THEN.
     // Refuses names below USER-DICT (static kernel). HERE rewound via negative ALLOT.
-    .ascii ": FORGET BL WORD FIND 0= IF DROP 63 EMIT CR EXIT THEN DUP USER-DICT U< IF DROP S\" protected\" TYPE CR EXIT THEN DUP @ LATEST ! DUP HERE - ALLOT DROP ; "
+    .ascii ": FORGET BL WORD FIND 0= IF DROP 63 EMIT CR EXIT THEN DUP USER-DICT U< IF DROP S\" protected\" TYPE CR EXIT THEN DUP >LINK @ LATEST ! DUP HERE - ALLOT DROP ; "
     // ANEW <name>  marker for reloadable modules (classic FPC/Win32Forth style).
-    // First time: CREATE name. Later: EXECUTE name (DOES> FORGETs itself) then re-CREATE.
-    .ascii ": ANEW >IN @ >R BL WORD FIND IF EXECUTE ELSE DROP THEN R> >IN ! CREATE LATEST @ , DOES> @ DUP @ LATEST ! DUP HERE - ALLOT DROP ; "
+    .ascii ": ANEW >IN @ >R BL WORD FIND IF EXECUTE ELSE DROP THEN R> >IN ! CREATE LATEST @ , DOES> @ DUP >LINK @ LATEST ! DUP HERE - ALLOT DROP ; "
     // ON / OFF — store 1 or 0 at addr (classic: FILE-ECHO ON  /  FILE-ECHO OFF)
     .ascii ": ON 1 SWAP ! ; "
     .ascii ": OFF 0 SWAP ! ; "
@@ -5801,1192 +5382,36 @@ forth_init_str:
     .ascii ": IS STATE @ IF POSTPONE ['] POSTPONE DEFER! ELSE ' DEFER! THEN ; IMMEDIATE "
     .ascii ": ACTION-OF STATE @ IF POSTPONE ['] POSTPONE DEFER@ ELSE ' DEFER@ THEN ; IMMEDIATE "
     // MARKER — executing name restores dictionary to just before MARKER was defined
-    .ascii ": MARKER CREATE LATEST @ , DOES> @ DUP @ LATEST ! DUP HERE - ALLOT DROP ; "
+    .ascii ": MARKER CREATE LATEST @ , DOES> @ DUP >LINK @ LATEST ! DUP HERE - ALLOT DROP ; "
 
     .byte 0  // null terminator
 
-// Trampoline for REPL execution: IP points here, then after the word
-// finishes via NEXT, it follows this cell to dict_restart which jumps back
-// to _interpret_loop.
+// REPL trampoline: restart_cell holds address of restart_cfa; that cell is XRESTART.
 .align 8
-dict_restart:                   // hidden entry, not in user dictionary
-    .quad 0                     // link (end of chain)
-    .quad 8                     // length=8 "RESTART" (won't be searched)
-    .quad XRESTART              // code field
-    .asciz "RESTART"
-dict_restart_end:
-    .space 8                    // pad to 8-byte boundary
-
-.align 8
-restart_cell:   .quad 0
-next_diag:      .skip 32  // x5, x19, x22, x20 for crash debugging
+restart_cfa:    .quad 0            // filled at boot: address of XRESTART code
+restart_cell:   .quad 0            // filled at boot: -> restart_cfa
+next_diag:      .skip 32
 catch_ok_cell:  .quad 0
-    .quad dict_restart          // cell IP points to when executing from REPL
 
-// ============================================================================
-// Static Dictionary (native / CODE words)
-// Stack comments use Forth notation ( before -- after ).
-// "xt" = dictionary entry address (see header). "flag" = 0 | -1.
-// ============================================================================
-.align 8
-
-dict_exit:  // EXIT ( -- )  return from colon definition
-    .quad 0                 // link
-    .quad 4                 // len
-    .quad DOEXIT            // code
-    .asciz "EXIT"
-    .space 4
-
-.align 8
-dict_semi:  // ; ( -- ) immediate
-    .quad dict_exit         // link -> EXIT
-    .quad 0x101             // immediate|1
-    .quad XSEMI             // code
-    .byte 59
-    .space 7
-
-.align 8
-dict_lit:  // LIT ( -- x )
-    .quad dict_semi
-    .quad 3
-    .quad XLit
-    .asciz "LIT"
-    .space 5
-
-.align 8
-dict_dup:  // DUP ( x -- x x )
-    .quad dict_lit
-    .quad 3
-    .quad XDUP
-    .asciz "DUP"
-    .space 5
-
-.align 8
-dict_drop:  // DROP ( x -- )
-    .quad dict_dup
-    .quad 4
-    .quad XDROP
-    .asciz "DROP"
-    .space 4
-
-.align 8
-dict_swap:  // SWAP ( a b -- b a )
-    .quad dict_drop
-    .quad 4
-    .quad XSWAP
-    .asciz "SWAP"
-    .space 4
-
-.align 8
-dict_over:  // OVER ( a b -- a b a )
-    .quad dict_swap
-    .quad 4
-    .quad XOVER
-    .asciz "OVER"
-    .space 4
-
-.align 8
-dict_rot:  // ROT ( a b c -- b c a )
-    .quad dict_over
-    .quad 3
-    .quad XROT
-    .asciz "ROT"
-    .space 5
-
-.align 8
-dict_nip:  // NIP ( a b -- b )
-    .quad dict_rot
-    .quad 3
-    .quad XNIP
-    .asciz "NIP"
-    .space 5
-
-.align 8
-dict_tuck:  // TUCK ( a b -- b a b )
-    .quad dict_nip
-    .quad 4
-    .quad XTUCK
-    .asciz "TUCK"
-    .space 4
-
-.align 8
-dict_pick:  // PICK ( u -- x )
-    .quad dict_tuck
-    .quad 4
-    .quad XPICK
-    .asciz "PICK"
-    .space 4
-
-.align 8
-dict_tor:  // >R ( x -- ) (R: -- x )
-    .quad dict_pick
-    .quad 2
-    .quad XTOR
-    .asciz ">R"
-    .space 6
-
-.align 8
-dict_rto:  // R> ( -- x ) (R: x -- )
-    .quad dict_tor
-    .quad 2
-    .quad XRTO
-    .asciz "R>"
-    .space 6
-
-.align 8
-dict_rfetch:  // R@ ( -- x ) (R: x -- x )
-    .quad dict_rto
-    .quad 2
-    .quad XRFETCH
-    .asciz "R@"
-    .space 6
-
-.align 8
-dict_plus:  // + ( n1 n2 -- n3 )
-    .quad dict_rfetch
-    .quad 1
-    .quad XPLUS
-    .byte 43
-    .space 7
-
-.align 8
-dict_minus:  // - ( n1 n2 -- n3 )
-    .quad dict_plus
-    .quad 1
-    .quad XMINUS
-    .byte 45
-    .space 7
-
-.align 8
-dict_star:  // * ( n1 n2 -- n3 )
-    .quad dict_minus
-    .quad 1
-    .quad XSTAR
-    .byte 42
-    .space 7
-
-.align 8
-dict_slash:  // / ( n1 n2 -- n3 )
-    .quad dict_star
-    .quad 1
-    .quad XSLASH
-    .byte 47
-    .space 7
-
-.align 8
-dict_mod:  // MOD ( n1 n2 -- n3 )
-    .quad dict_slash
-    .quad 3
-    .quad XMOD
-    .asciz "MOD"
-    .space 5
-
-.align 8
-dict_slmod:  // /MOD ( n1 n2 -- rem quot )
-    .quad dict_mod
-    .quad 4
-    .quad XSLMOD
-    .asciz "/MOD"
-    .space 4
-
-.align 8
-dict_equal:  // = ( n1 n2 -- flag )
-    .quad dict_slmod
-    .quad 1
-    .quad XEQUAL
-    .byte 61
-    .space 7
-
-.align 8
-dict_less:  // < ( n1 n2 -- flag )
-    .quad dict_equal
-    .quad 1
-    .quad XLESS
-    .byte 60
-    .space 7
-
-.align 8
-dict_greater:  // > ( n1 n2 -- flag )
-    .quad dict_less
-    .quad 1
-    .quad XGREATER
-    .byte 62
-    .space 7
-
-.align 8
-dict_uless:  // U< ( u1 u2 -- flag )
-    .quad dict_greater
-    .quad 2
-    .quad XULESS
-    .asciz "U<"
-    .space 6
-
-.align 8
-dict_and:  // AND ( x1 x2 -- x3 )
-    .quad dict_uless
-    .quad 3
-    .quad XAND
-    .asciz "AND"
-    .space 5
-
-.align 8
-dict_or:  // OR ( x1 x2 -- x3 )
-    .quad dict_and
-    .quad 2
-    .quad XORR
-    .asciz "OR"
-    .space 6
-
-.align 8
-dict_xor:  // XOR ( x1 x2 -- x3 )
-    .quad dict_or
-    .quad 3
-    .quad XXOR
-    .asciz "XOR"
-    .space 5
-
-.align 8
-dict_invert:  // INVERT ( x1 -- x2 )
-    .quad dict_xor
-    .quad 6
-    .quad XINVERT
-    .asciz "INVERT"
-    .space 2
-
-.align 8
-dict_zequal:  // 0= ( x -- flag )
-    .quad dict_invert
-    .quad 2
-    .quad XZEQUAL
-    .asciz "0="
-    .space 6
-
-.align 8
-dict_zless:  // 0< ( n -- flag )
-    .quad dict_zequal
-    .quad 2
-    .quad XZLESS
-    .asciz "0<"
-    .space 6
-
-.align 8
-dict_true:  // TRUE ( -- -1 )
-    .quad dict_zless
-    .quad 4
-    .quad XTRUE
-    .asciz "TRUE"
-    .space 4
-
-.align 8
-dict_false:  // FALSE ( -- 0 )
-    .quad dict_true
-    .quad 5
-    .quad XFALSE
-    .asciz "FALSE"
-    .space 3
-
-.align 8
-dict_oneplus:  // 1+ ( n -- n+1 )
-    .quad dict_false
-    .quad 2
-    .quad XONEPLUS
-    .asciz "1+"
-    .space 6
-
-.align 8
-dict_oneminus:  // 1- ( n -- n-1 )
-    .quad dict_oneplus
-    .quad 2
-    .quad XONEMINUS
-    .asciz "1-"
-    .space 6
-
-.align 8
-dict_cell:  // CELL ( -- 8 )
-    .quad dict_oneminus
-    .quad 4
-    .quad XCELL
-    .asciz "CELL"
-    .space 4
-
-.align 8
-dict_cells:  // CELLS ( n -- n*8 )
-    .quad dict_cell
-    .quad 5
-    .quad XCELLS
-    .asciz "CELLS"
-    .space 3
-
-.align 8
-dict_fetch:  // @ ( addr -- x )
-    .quad dict_cells
-    .quad 1
-    .quad XFETCH
-    .byte 64
-    .space 7
-
-.align 8
-dict_store:  // ! ( x addr -- )
-    .quad dict_fetch
-    .quad 1
-    .quad XSTORE
-    .byte 33
-    .space 7
-
-.align 8
-dict_cfetch:  // C@ ( addr -- char )
-    .quad dict_store
-    .quad 2
-    .quad XCFETCH
-    .asciz "C@"
-    .space 6
-
-.align 8
-dict_cstore:  // C! ( char addr -- )
-    .quad dict_cfetch
-    .quad 2
-    .quad XCSTORE
-    .asciz "C!"
-    .space 6
-
-.align 8
-dict_plusstore:  // +! ( n addr -- )
-    .quad dict_cstore
-    .quad 2
-    .quad XPLUSSTORE
-    .asciz "+!"
-    .space 6
-
-.align 8
-dict_emit:  // EMIT ( char -- )
-    .quad dict_plusstore
-    .quad 4
-    .quad XEMIT
-    .asciz "EMIT"
-    .space 4
-
-.align 8
-dict_key:  // KEY ( -- char )
-    .quad dict_emit
-    .quad 3
-    .quad XKEY
-    .asciz "KEY"
-    .space 5
-
-.align 8
-dict_cr:  // CR ( -- )
-    .quad dict_key
-    .quad 2
-    .quad XCR
-    .asciz "CR"
-    .space 6
-
-.align 8
-dict_dot:  // . ( n -- )
-    .quad dict_cr
-    .quad 1
-    .quad XDOT
-    .byte 46
-    .space 7
-
-.align 8
-dict_udot:  // U. ( u -- )
-    .quad dict_dot
-    .quad 2
-    .quad XUDOT
-    .asciz "U."
-    .space 6
-
-.align 8
-dict_dots:  // .S ( -- )
-    .quad dict_udot
-    .quad 2
-    .quad XDOTS
-    .asciz ".S"
-    .space 6
-
-.align 8
-dict_type:  // TYPE ( addr u -- )
-    .quad dict_dots
-    .quad 4
-    .quad XTYPE
-    .asciz "TYPE"
-    .space 4
-
-.align 8
-dict_state:  // STATE ( -- addr )
-    .quad dict_type
-    .quad 5
-    .quad XSTATE
-    .asciz "STATE"
-    .space 3
-
-.align 8
-dict_base:  // BASE ( -- addr )
-    .quad dict_state
-    .quad 4
-    .quad XBASE
-    .asciz "BASE"
-    .space 4
-
-.align 8
-dict_rbrack:  // ] ( -- ) switch to compile
-    .quad dict_base
-    .quad 1
-    .quad XRBRA
-    .byte 93
-    .space 7
-
-.align 8
-dict_lbrack:  // [ ( -- ) immediate, switch to interpret
-    .quad dict_rbrack
-    .quad 0x101
-    .quad XLBRA
-    .byte 91
-    .space 7
-
-.align 8
-dict_dp:  // DP ( -- a-addr )  dictionary pointer variable
-    .quad dict_lbrack
-    .quad 2
-    .quad XDP
-    .asciz "DP"
-    .space 6
-
-.align 8
-dict_here:  // HERE ( -- addr )  also redefined high-level as DP @
-    .quad dict_dp
-    .quad 4
-    .quad XHERE
-    .asciz "HERE"
-    .space 4
-
-.align 8
-dict_alot:  // ALLOT ( n -- )
-    .quad dict_here
-    .quad 5
-    .quad XALLOT
-    .asciz "ALLOT"
-    .space 3
-
-.align 8
-dict_comma:  // , ( x -- )
-    .quad dict_alot
-    .quad 1
-    .quad XCOMMA
-    .byte 44
-    .space 7
-
-.align 8
-dict_find:  // FIND ( c-addr -- c-addr 0 | xt 1 | xt -1 ) ANS counted string
-    .quad dict_comma
-    .quad 4
-    .quad XFIND
-    .asciz "FIND"
-    .space 4
-
-.align 8
-dict_tick:  // ' ( "<spaces>name" -- xt )  xt = dictionary entry address
-    .quad dict_find
-    .quad 1
-    .quad XTICK
-    .byte 39
-    .space 7
-
-.align 8
-dict_execute:  // EXECUTE ( xt -- )  run dictionary entry
-    .quad dict_tick
-    .quad 7
-    .quad XEXECUTE
-    .asciz "EXECUTE"
-    .space 1
-
-.align 8
-dict_literal:  // LITERAL ( x -- ) immediate
-    .quad dict_execute
-    .quad 0x107             // immediate | len=7
-    .quad XLITERAL
-    .asciz "LITERAL"
-    .space 1
-
-.align 8
-dict_immediate:  // IMMEDIATE ( -- )
-    .quad dict_literal
-    .quad 9
-    .quad XIMMEDIATE
-    .asciz "IMMEDIATE"
-    .space 7
-
-.align 8
-dict_colon:  // : ( "name" -- )
-    .quad dict_immediate
-    .quad 1
-    .quad XCOLON
-    .byte 58
-    .space 7
-
-.align 8
-dict_create:  // CREATE ( "name" -- )
-    .quad dict_colon
-    .quad 6
-    .quad XCREATE
-    .asciz "CREATE"
-    .space 2
-
-.align 8
-dict_0branch:  // 0BRANCH ( -- )
-    .quad dict_create
-    .quad 7
-    .quad X0Branch
-    .asciz "0BRANCH"
-    .space 1
-
-.align 8
-dict_branch:  // BRANCH ( -- )
-    .quad dict_0branch
-    .quad 6
-    .quad XBranch
-    .asciz "BRANCH"
-    .space 2
-
-.align 8
-dict_bye:  // BYE ( -- )
-    .quad dict_branch
-    .quad 3
-    .quad XBYE
-    .asciz "BYE"
-    .space 5
-
-.align 8
-dict_include:  // INCLUDE ( "name" -- )
-    .quad dict_bye
-    .quad 7
-    .quad XINCLUDE
-    .asciz "INCLUDE"
-    .space 1
-
-.align 8
-dict_latest:  // LATEST ( -- addr )
-    .quad dict_include
-    .quad 6
-    .quad XLATEST
-    .asciz "LATEST"
-    .space 2
-
-.align 8
-dict_qdup:  // ?DUP ( x -- x x | 0 )
-    .quad dict_latest
-    .quad 4
-    .quad XQDUP
-    .asciz "?DUP"
-    .space 4
-
-.align 8
-dict_bracket_tick:  // ['] ( "name" -- entry ) immediate
-    .quad dict_qdup
-    .quad 0x103             // immediate | len=3
-    .quad XBRACKET_TICK
-    .byte 91        // '['
-    .byte 39        // '''
-    .byte 93        // ']'
-    .space 5
-
-.align 8
-dict_lit_addr:  // LIT-ADDR ( -- addr )
-    .quad dict_bracket_tick
-    .quad 8
-    .quad XLIT_ADDR
-    .asciz "LIT-ADDR"
-    .space 8
-
-.align 8
-dict_0br_addr:  // 0BRANCH-ADDR ( -- addr )
-    .quad dict_lit_addr
-    .quad 12
-    .quad X0BRANCH_ADDR
-    .asciz "0BRANCH-ADDR"
-    .space 4
-
-.align 8
-dict_br_addr:  // BRANCH-ADDR ( -- addr )
-    .quad dict_0br_addr
-    .quad 11
-    .quad XBRANCH_ADDR
-    .asciz "BRANCH-ADDR"
-    .space 5
-
-.align 8
-dict_exit_addr:  // EXIT-ADDR ( -- addr )
-    .quad dict_br_addr
-    .quad 9
-    .quad XEXIT_ADDR
-    .asciz "EXIT-ADDR"
-    .space 7
-
-.align 8
-dict_negate:  // NEGATE ( n1 -- n2 ) ANS
-    .quad dict_exit_addr
-    .quad 6
-    .quad XNEGATE
-    .asciz "NEGATE"
-    .space 2
-
-.align 8
-dict_abs:  // ABS ( n -- u ) ANS
-    .quad dict_negate
-    .quad 3
-    .quad XABS
-    .asciz "ABS"
-    .space 5
-
-.align 8
-dict_min:  // MIN ( n1 n2 -- n3 ) ANS
-    .quad dict_abs
-    .quad 3
-    .quad XMIN
-    .asciz "MIN"
-    .space 5
-
-.align 8
-dict_max:  // MAX ( n1 n2 -- n3 ) ANS
-    .quad dict_min
-    .quad 3
-    .quad XMAX
-    .asciz "MAX"
-    .space 5
-
-.align 8
-dict_lshift:  // LSHIFT ( x1 u -- x2 ) ANS
-    .quad dict_max
-    .quad 6
-    .quad XLSHIFT
-    .asciz "LSHIFT"
-    .space 2
-
-.align 8
-dict_rshift:  // RSHIFT ( x1 u -- x2 ) ANS
-    .quad dict_lshift
-    .quad 6
-    .quad XRSHIFT
-    .asciz "RSHIFT"
-    .space 2
-
-.align 8
-dict_nequal:  // <> ( x1 x2 -- flag ) ANS
-    .quad dict_rshift
-    .quad 2
-    .quad XNEQUAL
-    .asciz "<>"
-    .space 6
-
-.align 8
-dict_parse:  // PARSE ( char "ccc<char>" -- c-addr u ) ANS
-    .quad dict_nequal
-    .quad 5
-    .quad XPARSE
-    .asciz "PARSE"
-    .space 3
-
-.align 8
-dict_word:  // WORD ( char "<chars>ccc<char>" -- c-addr ) ANS
-    .quad dict_parse
-    .quad 4
-    .quad XWORD
-    .asciz "WORD"
-    .space 4
-
-.align 8
-dict_backslash:  // \ ( -- ) IMMEDIATE  ANS line comment
-    .quad dict_word
-    .quad 0x101
-    .quad XBACKSLASH
-    .byte 92
-    .space 7
-
-.align 8
-dict_paren:  // ( ( -- ) IMMEDIATE  ANS paren comment
-    .quad dict_backslash
-    .quad 0x101
-    .quad XPAREN
-    .byte 40
-    .space 7
-
-.align 8
-dict_docon_addr:  // DOCON-ADDR ( -- addr )  code address of DOCON (for CONSTANT)
-    .quad dict_paren
-    .quad 10
-    .quad XDOCON_ADDR
-    .asciz "DOCON-ADDR"
-    .space 6
-
-.align 8
-dict_source:  // SOURCE ( -- c-addr u ) ANS
-    .quad dict_docon_addr
-    .quad 6
-    .quad XSOURCE
-    .asciz "SOURCE"
-    .space 2
-
-.align 8
-dict_to_in:  // >IN ( -- a-addr ) ANS
-    .quad dict_source
-    .quad 3
-    .quad XTOIN
-    .asciz ">IN"
-    .space 5
-
-.align 8
-dict_slit:  // (S") ( -- c-addr u ) runtime helper for S" / ."
-    .quad dict_to_in
-    .quad 4
-    .quad XSLIT
-    .asciz "(S\")"
-    .space 4
-
-.align 8
-dict_squote:  // S" ( -- c-addr u ) IMMEDIATE ANS
-    .quad dict_slit
-    .quad 0x102
-    .quad XSQUOTE
-    .byte 83, 34                    // S"
-    .space 6
-
-.align 8
-dict_dotquote:  // ." ( -- ) IMMEDIATE ANS
-    .quad dict_squote
-    .quad 0x102
-    .quad XDOTQ
-    .byte 46, 34                    // ."
-    .space 6
-
-
-.align 8
-dict_do_rt:  // (DO) ( limit index -- ) R: -- limit index
-    .quad dict_dotquote
-    .quad 4
-    .quad XDO_RT
-    .asciz "(DO)"
-    .space 4
-
-.align 8
-dict_qdo_rt:  // (?DO) ( limit index -- )
-    .quad dict_do_rt
-    .quad 5
-    .quad XQDO_RT
-    .asciz "(?DO)"
-    .space 3
-
-.align 8
-dict_loop_rt:  // (LOOP) ( -- )
-    .quad dict_qdo_rt
-    .quad 6
-    .quad XLOOP_RT
-    .asciz "(LOOP)"
-    .space 2
-
-.align 8
-dict_ploop_rt:  // (+LOOP) ( n -- )
-    .quad dict_loop_rt
-    .quad 7
-    .quad XPLUSLOOP_RT
-    .asciz "(+LOOP)"
-    .space 1
-
-.align 8
-dict_i:  // I ( -- n )
-    .quad dict_ploop_rt
-    .quad 1
-    .quad XI
-    .byte 73
-    .space 7
-
-.align 8
-dict_j:  // J ( -- n )
-    .quad dict_i
-    .quad 1
-    .quad XJ
-    .byte 74
-    .space 7
-
-.align 8
-dict_unloop:  // UNLOOP ( -- )
-    .quad dict_j
-    .quad 6
-    .quad XUNLOOP
-    .asciz "UNLOOP"
-    .space 2
-
-.align 8
-dict_leave:  // LEAVE ( -- )
-    .quad dict_unloop
-    .quad 5
-    .quad XLEAVE
-    .asciz "LEAVE"
-    .space 3
-
-.align 8
-dict_does_rt:  // (DOES>) ( -- )
-    .quad dict_leave
-    .quad 7
-    .quad XDOES_RT
-    .asciz "(DOES>)"
-    .space 1
-
-.align 8
-dict_pad:  // PAD ( -- c-addr )
-    .quad dict_does_rt
-    .quad 3
-    .quad XPAD
-    .asciz "PAD"
-    .space 5
-
-.align 8
-dict_does:  // DOES> ( -- ) IMMEDIATE
-    .quad dict_pad
-    .quad 0x105
-    .quad XDOES
-    .asciz "DOES>"
-    .space 3
-
-.align 8
-dict_evaluate:  // EVALUATE ( c-addr u -- ) ANS
-    .quad dict_does
-    .quad 8
-    .quad XEVALUATE
-    .asciz "EVALUATE"
-    .space 8
-
-.align 8
-dict_catch:  // CATCH ( i*x xt -- j*x 0 | i*x n ) ANS
-    .quad dict_evaluate
-    .quad 5
-    .quad XCATCH
-    .asciz "CATCH"
-    .space 3
-
-.align 8
-dict_throw:  // THROW ( k -- ) ANS
-    .quad dict_catch
-    .quad 5
-    .quad XTHROW
-    .asciz "THROW"
-    .space 3
-
-.align 8
-dict_catch_ok:  // (CATCH-OK) internal
-    .quad dict_throw
-    .quad 10
-    .quad XCATCH_OK
-    .asciz "(CATCH-OK)"
-    .space 6
-
-.align 8
-dict_contains:  // CONTAINS ( hay-a hay-u ned-a ned-u -- flag )
-    .quad dict_catch_ok
-    .quad 8
-    .quad XCONTAINS
-    .asciz "CONTAINS"
-    .space 8
-
-.align 8
-dict_msfetch:  // MS@ ( -- u ) milliseconds (wall clock)
-    .quad dict_contains
-    .quad 3
-    .quad XMSFETCH
-    .asciz "MS@"
-    .space 5
-
-.align 8
-dict_unused:  // UNUSED ( -- u ) free user dictionary bytes
-    .quad dict_msfetch
-    .quad 6
-    .quad XUNUSED
-    .asciz "UNUSED"
-    .space 2
-
-.align 8
-dict_redef_warning:  // REDEF-WARNING ( -- addr )  warn on redefine when nonzero
-    .quad dict_unused
-    .quad 13
-    .quad XREDEF_WARNING
-    .asciz "REDEF-WARNING"
-    .space 3
-
-.align 8
-dict_user_dict:  // USER-DICT ( -- addr )  base of user dictionary
-    .quad dict_redef_warning
-    .quad 9
-    .quad XUSER_DICT
-    .asciz "USER-DICT"
-    .space 7
-
-.align 8
-dict_sp0:  // SP0 ( -- addr )  empty data-stack DSP
-    .quad dict_user_dict
-    .quad 3
-    .quad XSP0
-    .asciz "SP0"
-    .space 5
-
-.align 8
-dict_spfetch:  // SP@ ( -- addr )  current DSP
-    .quad dict_sp0
-    .quad 3
-    .quad XSPFETCH
-    .asciz "SP@"
-    .space 5
-
-.align 8
-dict_spstore:  // SP! ( addr -- )  set DSP; clear TOS cache
-    .quad dict_spfetch
-    .quad 3
-    .quad XSPSTORE
-    .asciz "SP!"
-    .space 5
-
-.align 8
-dict_spaces:  // SPACES ( n -- )
-    .quad dict_spstore
-    .quad 6
-    .quad XSPACES
-    .asciz "SPACES"
-    .space 2
-
-.align 8
-dict_ccomma:  // C, ( char -- )
-    .quad dict_spaces
-    .quad 2
-    .quad XCCOMMA
-    .asciz "C,"
-    .space 6
-
-.align 8
-dict_stod:  // S>D ( n -- d )
-    .quad dict_ccomma
-    .quad 3
-    .quad XSTOD
-    .asciz "S>D"
-    .space 5
-
-.align 8
-dict_twostar:  // 2* ( x1 -- x2 )
-    .quad dict_stod
-    .quad 2
-    .quad XTWOSTAR
-    .asciz "2*"
-    .space 6
-
-.align 8
-dict_twoslash:  // 2/ ( x1 -- x2 )
-    .quad dict_twostar
-    .quad 2
-    .quad XTWOSLASH
-    .asciz "2/"
-    .space 6
-
-.align 8
-dict_twofetch:  // 2@ ( a-addr -- x1 x2 )
-    .quad dict_twoslash
-    .quad 2
-    .quad XTWOFETCH
-    .asciz "2@"
-    .space 6
-
-.align 8
-dict_twostore:  // 2! ( x1 x2 a-addr -- )
-    .quad dict_twofetch
-    .quad 2
-    .quad XTWOSTORE
-    .asciz "2!"
-    .space 6
-
-.align 8
-dict_umstar:  // UM* ( u1 u2 -- ud )
-    .quad dict_twostore
-    .quad 3
-    .quad XUMSTAR
-    .asciz "UM*"
-    .space 5
-
-.align 8
-dict_mstar:  // M* ( n1 n2 -- d )
-    .quad dict_umstar
-    .quad 2
-    .quad XMSTAR
-    .asciz "M*"
-    .space 6
-
-.align 8
-dict_ummod:  // UM/MOD ( ud u1 -- u2 u3 )
-    .quad dict_mstar
-    .quad 6
-    .quad XUMMOD
-    .asciz "UM/MOD"
-    .space 2
-
-.align 8
-dict_smrem:  // SM/REM ( d1 n1 -- n2 n3 )
-    .quad dict_ummod
-    .quad 6
-    .quad XSMREM
-    .asciz "SM/REM"
-    .space 2
-
-.align 8
-dict_fmmod:  // FM/MOD ( d1 n1 -- n2 n3 )
-    .quad dict_smrem
-    .quad 6
-    .quad XFMMOD
-    .asciz "FM/MOD"
-    .space 2
-
-.align 8
-dict_quit:  // QUIT ( -- )  CODE outer interpreter
-    .quad dict_fmmod
-    .quad 4
-    .quad XQUIT
-    .asciz "QUIT"
-    .space 4
-
-.align 8
-dict_source_id:  // SOURCE-ID ( -- n )
-    .quad dict_quit
-    .quad 9
-    .quad XSOURCE_ID
-    .asciz "SOURCE-ID"
-    .space 7
-
-.align 8
-dict_refill:  // REFILL ( -- flag )
-    .quad dict_source_id
-    .quad 6
-    .quad XREFILL
-    .asciz "REFILL"
-    .space 2
-
-.align 8
-dict_accept:  // ACCEPT ( c-addr +n1 -- +n2 )
-    .quad dict_refill
-    .quad 6
-    .quad XACCEPT
-    .asciz "ACCEPT"
-    .space 2
-
-.align 8
-dict_to_number:  // >NUMBER ( ud1 c-addr1 u1 -- ud2 c-addr2 u2 )
-    .quad dict_accept
-    .quad 7
-    .quad XTONUMBER
-    .asciz ">NUMBER"
-    .space 1
-
-.align 8
-dict_environment_q:  // ENVIRONMENT? ( c-addr u -- false | i*x true )
-    .quad dict_to_number
-    .quad 12
-    .quad XENVIRONMENT_Q
-    .asciz "ENVIRONMENT?"
-    .space 4
-
-.align 8
-dict_file_echo:  // FILE-ECHO ( -- addr )  echo INCLUDE lines when nonzero
-    .quad dict_environment_q
-    .quad 9
-    .quad XFILE_ECHO
-    .asciz "FILE-ECHO"
-    .space 7
-
-.align 8
-dict_parse_name:  // PARSE-NAME ( -- c-addr u )
-    .quad dict_file_echo
-    .quad 10
-    .quad XPARSE_NAME
-    .asciz "PARSE-NAME"
-    .space 6
-
-.align 8
-dict_2tor:  // 2>R ( x1 x2 -- ) ( R: -- x1 x2 )
-    .quad dict_parse_name
-    .quad 3
-    .quad X2TOR
-    .asciz "2>R"
-    .space 5
-
-.align 8
-dict_2rto:  // 2R> ( -- x1 x2 ) ( R: x1 x2 -- )
-    .quad dict_2tor
-    .quad 3
-    .quad X2RTO
-    .asciz "2R>"
-    .space 5
-
-.align 8
-dict_2rfetch:  // 2R@ ( -- x1 x2 ) ( R: x1 x2 -- x1 x2 )
-    .quad dict_2rto
-    .quad 3
-    .quad X2RFETCH
-    .asciz "2R@"
-    .space 5
-
-.align 8
-dict_roll:  // ROLL ( xu ... x0 u -- ... xu )
-    .quad dict_2rfetch
-    .quad 4
-    .quad XROLL
-    .asciz "ROLL"
-    .space 4
-
-.align 8
-dict_noname:  // :NONAME ( -- )  ; leaves xt
-    .quad dict_roll
-    .quad 7
-    .quad XNONAME
-    .asciz ":NONAME"
-    .space 1
-
-.align 8
-dict_cstr:  // (C") ( -- c-addr ) runtime counted string
-    .quad dict_noname
-    .quad 4
-    .quad XCSTR
-    .asciz "(C\")"
-    .space 4
-
-.align 8
-dict_cquote:  // C" ( -- c-addr ) IMMEDIATE
-    .quad dict_cstr
-    .quad 0x102
-    .quad XCQUOTE
-    .byte 67, 34                   // C"
-    .space 6
-
-.align 8
-dict_sescape:  // S\" ( -- c-addr u ) IMMEDIATE
-    .quad dict_cquote
-    .quad 0x103
-    .quad XSESCAPE
-    .byte 83, 92, 34               // S\"
-    .space 5
-
-.align 8
-dict_save_input:  // SAVE-INPUT ( -- xn..x1 n )
-    .quad dict_sescape
-    .quad 10
-    .quad XSAVE_INPUT
-    .asciz "SAVE-INPUT"
-    .space 6
-
-.align 8
-dict_restore_input:  // RESTORE-INPUT ( xn..x1 n -- flag )
-    .quad dict_save_input
-    .quad 13
-    .quad XRESTORE_INPUT
-    .asciz "RESTORE-INPUT"
-    .space 3
+// Cached CFAs for assembler (filled by _boot_cache_cfa)
+.align 8
+cfa_lit:        .quad 0
+cfa_exit:       .quad 0
+cfa_slit:       .quad 0
+cfa_cstr:       .quad 0
+cfa_type:       .quad 0
+cfa_branch:     .quad 0
+cfa_0branch:    .quad 0
+cfa_does_rt:    .quad 0
+cfa_catch_ok:   .quad 0
+
+// Boot catalog (structured records + name strings)
+.include "boot_words.inc"
 
 // ============================================================================
 // User dictionary space (grows upward)
-// Size = USER_DICT_SIZE (128 KiB); keep in sync with XUNUSED
+// Size = USER_DICT_SIZE (128 KiB + 100 KiB)
 // ============================================================================
 .align 8
-user_dict_area: .skip USER_DICT_SIZE
+user_dict_area:
+    .skip USER_DICT_SIZE

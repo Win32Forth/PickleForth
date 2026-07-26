@@ -13,6 +13,7 @@
 /* Begin PBXFileReference section */
 		A1000002 /* forth.s */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.asm; path = forth.s; sourceTree = "<group>"; };
 		A1000003 /* PickleForth */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = PickleForth; sourceTree = BUILT_PRODUCTS_DIR; };
+		A1000016 /* boot_words.inc */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.asm; path = boot_words.inc; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -30,6 +31,7 @@
 			isa = PBXGroup;
 			children = (
 				A1000002 /* forth.s */,
+				A1000016 /* boot_words.inc */,
 				A1000006 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -210,7 +212,7 @@
 				DEAD_CODE_STRIPPING = YES;
 				EXCLUDED_ARCHS = "x86_64 i386";
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 0.2.0;
+				MARKETING_VERSION = 0.3.0;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				VALID_ARCHS = arm64;
 			};
@@ -224,7 +226,7 @@
 				DEAD_CODE_STRIPPING = YES;
 				EXCLUDED_ARCHS = "x86_64 i386";
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 0.2.0;
+				MARKETING_VERSION = 0.3.0;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				VALID_ARCHS = arm64;
 			};
